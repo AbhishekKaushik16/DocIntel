@@ -1,7 +1,6 @@
 """Tests for Stage 1: Document Classifier."""
 
 import pytest
-from app.models.document import DocumentType
 from app.pipeline.classifier import classify_by_heuristic, classify_document
 
 
@@ -17,7 +16,7 @@ def test_classify_invoice_heuristic():
     Payment Terms: Net 30
     """
     res = classify_by_heuristic(invoice_text)
-    assert res.document_type == DocumentType.INVOICE
+    assert res.document_type == "invoice"
     assert res.confidence >= 0.5
 
 
@@ -34,7 +33,7 @@ def test_classify_retail_tax_invoice_heuristic():
     TOTAL: INR 287.00
     """
     res = classify_by_heuristic(invoice_text)
-    assert res.document_type == DocumentType.INVOICE
+    assert res.document_type == "invoice"
     assert res.confidence >= 0.5
 
 
@@ -52,7 +51,7 @@ def test_classify_receipt_heuristic():
     Paid. Thank you for your purchase!
     """
     res = classify_by_heuristic(receipt_text)
-    assert res.document_type == DocumentType.RECEIPT
+    assert res.document_type == "receipt"
     assert res.confidence >= 0.5
 
 
@@ -68,7 +67,7 @@ def test_classify_contract_heuristic():
     Signature: ______________
     """
     res = classify_by_heuristic(contract_text)
-    assert res.document_type == DocumentType.CONTRACT
+    assert res.document_type == "contract"
     assert res.confidence >= 0.5
 
 
@@ -89,7 +88,7 @@ def test_classify_resume_heuristic():
     Skills: Python, FastAPI, React, PostgreSQL
     """
     res = classify_by_heuristic(resume_text)
-    assert res.document_type == DocumentType.RESUME
+    assert res.document_type == "resume"
     assert res.confidence >= 0.5
 
 
@@ -109,7 +108,7 @@ def test_classify_resume_without_resume_keyword():
     Software Engineer
     """
     res = classify_by_heuristic(resume_text)
-    assert res.document_type == DocumentType.RESUME
+    assert res.document_type == "resume"
     assert res.confidence >= 0.5
 
 
@@ -117,4 +116,4 @@ def test_classify_resume_without_resume_keyword():
 async def test_classify_document_fallback():
     text = "Just some random notes from a meeting on Tuesday."
     res = await classify_document(text)
-    assert res.document_type in [DocumentType.GENERIC, DocumentType.INVOICE, DocumentType.RECEIPT, DocumentType.CONTRACT, DocumentType.RESUME]
+    assert isinstance(res.document_type, str)

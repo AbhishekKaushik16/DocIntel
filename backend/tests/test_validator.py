@@ -4,7 +4,6 @@ import json
 
 import pytest
 
-from app.models.document import DocumentType
 from app.pipeline.extractor import extract_with_llm, extract_with_regex
 from app.pipeline.validator import validate_and_score
 
@@ -18,7 +17,7 @@ def test_regex_extractor_invoice():
     Subtotal: $1,150.00
     Email: billing@acme.com
     """
-    data = extract_with_regex(text, DocumentType.INVOICE)
+    data = extract_with_regex(text, "invoice")
     assert data["invoice_number"] == "INV-9988"
     assert data["invoice_date"] == "2024-04-10"
     assert data["total_amount"] == 1250.00
@@ -39,7 +38,7 @@ def test_regex_extractor_resume():
     01/2021 - Current
     Senior Developer
     """
-    data = extract_with_regex(text, DocumentType.RESUME)
+    data = extract_with_regex(text, "resume")
     assert data["full_name"] == "John Smith"
     assert data["email"] == "john.smith@tech.org"
     assert data["phone"] == "+1-555-019-2834"
@@ -69,10 +68,7 @@ async def test_gemini_extractor_uses_json_generation_config(monkeypatch):
                                             "email": "john.smith@tech.org",
                                             "phone": "+1-555-019-2834",
                                             "location": "Austin, Texas",
-                                            "summary": None,
                                             "skills": ["Python", "SQL"],
-                                            "work_experience": [],
-                                            "education": [],
                                             "linkedin_url": "https://linkedin.com/in/johnsmith",
                                         }
                                     )
@@ -104,17 +100,13 @@ async def test_gemini_extractor_uses_json_generation_config(monkeypatch):
     monkeypatch.setattr("app.pipeline.extractor.settings.gemini_model", "gemini-test")
     monkeypatch.setattr("app.pipeline.extractor.httpx.AsyncClient", FakeAsyncClient)
 
-    data = await extract_with_llm("John Smith\njohn.smith@tech.org", DocumentType.RESUME)
+    data = await extract_with_llm("John Smith\njohn.smith@tech.org", "resume")
 
     assert data["full_name"] == "John Smith"
     assert captured["url"].endswith("/models/gemini-test:generateContent")
     assert captured["headers"]["x-goog-api-key"] == "test-key"
     generation_config = captured["payload"]["generationConfig"]
     assert generation_config["responseMimeType"] == "application/json"
-    assert "responseSchema" not in generation_config
-    response_schema = generation_config["responseJsonSchema"]
-    assert response_schema["properties"]["full_name"]["anyOf"]
-    assert "default" not in json.dumps(response_schema)
 
 
 def test_validator_invoice_consistency():
@@ -134,7 +126,7 @@ def test_validator_invoice_consistency():
 
     res = validate_and_score(
         extracted_data=data,
-        document_type=DocumentType.INVOICE,
+        document_type="invoice",
         extraction_method="llm",
     )
 
@@ -154,10 +146,9 @@ def test_validator_invoice_mismatch_warning():
 
     res = validate_and_score(
         extracted_data=data,
-        document_type=DocumentType.INVOICE,
+        document_type="invoice",
         extraction_method="llm",
     )
 
-    # Should have a warning for the total mismatch
     warnings = [i for i in res.issues if i.field == "total_amount"]
     assert len(warnings) > 0

@@ -1,7 +1,6 @@
 from app.models.document import (
     Document,
     DocumentStatus,
-    DocumentType,
     ExtractedField,
     PipelineStage,
     ProcessingLog,
@@ -11,7 +10,6 @@ from app.models.document import (
 __all__ = [
     "Document",
     "DocumentStatus",
-    "DocumentType",
     "ExtractedField",
     "PipelineStage",
     "ProcessingLog",

@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.document import DocumentStatus, DocumentType, PipelineStage, StageStatus
+from app.models.document import DocumentStatus, PipelineStage, StageStatus
 
 
 # ──────────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ class DocumentResponse(BaseModel):
     mime_type: str | None
     file_size_bytes: int | None
     status: DocumentStatus
-    document_type: DocumentType | None
+    document_type: str | None
     confidence_score: float | None
     extracted_data: dict[str, Any] | None
     created_at: datetime
@@ -72,7 +72,7 @@ class DocumentListItem(BaseModel):
     mime_type: str | None
     file_size_bytes: int | None
     status: DocumentStatus
-    document_type: DocumentType | None
+    document_type: str | None
     confidence_score: float | None
     created_at: datetime
     processed_at: datetime | None
@@ -118,7 +118,7 @@ class SearchResult(BaseModel):
 
     id: uuid.UUID
     original_filename: str
-    document_type: DocumentType | None
+    document_type: str | None
     status: DocumentStatus
     confidence_score: float | None
     relevance_score: float | None = None

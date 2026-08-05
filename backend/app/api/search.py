@@ -8,7 +8,7 @@ from sqlalchemy import func, select, text, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Document, DocumentStatus, DocumentType
+from app.models import Document, DocumentStatus
 from app.schemas import SearchResponse, SearchResult
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -17,7 +17,7 @@ router = APIRouter(prefix="/api/search", tags=["search"])
 @router.get("", response_model=SearchResponse)
 async def search_documents(
     q: str = Query(..., min_length=1, description="Search query"),
-    type_filter: DocumentType | None = Query(None, alias="type"),
+    type_filter: str | None = Query(None, alias="type"),
     status_filter: DocumentStatus | None = Query(None, alias="status"),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),

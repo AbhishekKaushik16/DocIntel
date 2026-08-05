@@ -69,15 +69,6 @@ class DocumentStatus(str, enum.Enum):
     NEEDS_REVIEW = "needs_review"
 
 
-class DocumentType(str, enum.Enum):
-    """Supported document type classifications."""
-    INVOICE = "invoice"
-    RECEIPT = "receipt"
-    CONTRACT = "contract"
-    RESUME = "resume"
-    GENERIC = "generic"
-
-
 class PipelineStage(str, enum.Enum):
     """Processing pipeline stages."""
     CLASSIFY = "classify"
@@ -115,7 +106,7 @@ class Document(Base):
         index=True,
     )
     document_type = Column(
-        Enum(DocumentType),
+        String(100),
         nullable=True,
         index=True,
     )

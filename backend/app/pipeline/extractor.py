@@ -2,11 +2,8 @@
 Stage 3: Structured Data Extractor
 
 Extracts structured data from parsed text using either:
-1. LLM with structured outputs (primary — when API key is available)
-2. Regex-based extraction (fallback — always available)
-
-Each document type has a dedicated Pydantic schema that defines
-the expected output structure.
+1. LLM with open-ended schema discovery (primary — when API key is available)
+2. Regex-based extraction (fallback — for offline / no-LLM mode)
 """
 
 import json
@@ -17,63 +14,34 @@ import httpx
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.models.document import DocumentType
 
 
 # ══════════════════════════════════════════════════════════════
-# Extraction Schemas (per document type)
+# Fallback Extraction Schemas (for regex fallback only)
 # ══════════════════════════════════════════════════════════════
-
 
 class LineItem(BaseModel):
     """A single line item on an invoice or receipt."""
     description: str = ""
-    product_code: str | None = None
-    hsn_code: str | None = None
     quantity: float | None = None
     unit_price: float | None = None
-    net_amount: float | None = None
-    tax_rate: str | None = None
-    tax_type: str | None = None
-    tax_amount: float | None = None
     amount: float | None = None
-
-
-class TaxRegistration(BaseModel):
-    """Seller tax and compliance identifiers."""
-    pan_number: str | None = None
-    gst_registration_number: str | None = None
-    fssai_license_number: str | None = None
 
 
 class InvoiceExtraction(BaseModel):
     """Structured data extracted from an invoice."""
     invoice_number: str | None = None
-    order_number: str | None = None
-    invoice_details: str | None = None
     invoice_date: str | None = None
-    order_date: str | None = None
     due_date: str | None = None
     vendor_name: str | None = None
     vendor_address: str | None = None
-    vendor_tax_registration: TaxRegistration | None = None
     bill_to_name: str | None = None
     bill_to_address: str | None = None
-    ship_to_name: str | None = None
-    ship_to_address: str | None = None
-    place_of_supply: str | None = None
-    place_of_delivery: str | None = None
     line_items: list[LineItem] = Field(default_factory=list)
     subtotal: float | None = None
     tax_amount: float | None = None
     total_amount: float | None = None
-    amount_in_words: str | None = None
-    invoice_value: float | None = None
-    payment_transaction_id: str | None = None
-    payment_datetime: str | None = None
-    payment_mode: str | None = None
-    reverse_charge_applicable: bool | None = None
-    currency: str = "INR"
+    currency: str = "USD"
     payment_terms: str | None = None
     notes: str | None = None
 
@@ -147,29 +115,19 @@ class GenericExtraction(BaseModel):
     urls: list[str] = Field(default_factory=list)
 
 
-# Schema map
-EXTRACTION_SCHEMAS: dict[DocumentType, type[BaseModel]] = {
-    DocumentType.INVOICE: InvoiceExtraction,
-    DocumentType.RECEIPT: ReceiptExtraction,
-    DocumentType.CONTRACT: ContractExtraction,
-    DocumentType.RESUME: ResumeExtraction,
-    DocumentType.GENERIC: GenericExtraction,
-}
-
-
 # ══════════════════════════════════════════════════════════════
-# LLM Extraction
+# LLM Open-Ended Extraction
 # ══════════════════════════════════════════════════════════════
 
 
 async def extract_with_llm(
     text: str,
-    document_type: DocumentType,
+    document_type: str,
 ) -> dict[str, Any]:
     """
     Extract structured data using the configured LLM provider.
 
-    Uses the document type's Pydantic schema to enforce output structure.
+    Discovers fields dynamically from the document without forcing a hardcoded schema.
     """
     provider = settings.llm_provider.lower()
     if provider == "openai":
@@ -179,107 +137,61 @@ async def extract_with_llm(
     raise ValueError(f"Unsupported LLM provider: {settings.llm_provider}")
 
 
-def _build_extraction_prompt(text: str, document_type: DocumentType) -> str:
-    schema_class = EXTRACTION_SCHEMAS[document_type]
-    schema = _json_schema_for_provider(schema_class)
+def _build_extraction_prompt(text: str, document_type: str) -> str:
     truncated_text = text[:8000]
     return (
-        f"You are a document data extractor. Extract structured data from the following "
-        f"{document_type.value} document. Return only a JSON object matching this schema. "
-        f"If a field cannot be determined from the text, use null. "
-        f"Be precise and extract only what is explicitly stated.\n\n"
-        f"JSON schema:\n{json.dumps(schema, indent=2)}\n\n"
+        f"You are an expert document data extractor. Extract ALL relevant structured data from this "
+        f"'{document_type}' document.\n\n"
+        f"Return ONLY a single valid JSON object. Do not include markdown code block syntax unless necessary.\n"
+        f"Rules:\n"
+        f"1. Use snake_case for all JSON field names.\n"
+        f"2. Extract dates, amounts, names, addresses, line items, status, terms, identifiers, and any key entities.\n"
+        f"3. Preserve nested lists or structures (e.g. line_items, items, work_experience) where appropriate.\n"
+        f"4. If a field cannot be determined, use null.\n"
+        f"5. Be precise and extract only facts explicitly stated in the document.\n\n"
         f"Document text:\n{truncated_text}"
     )
 
 
-def _json_schema_for_provider(schema_class: type[BaseModel]) -> dict[str, Any]:
-    """Return JSON Schema without Pydantic keywords Gemini rejects."""
-    return _strip_json_schema_keywords(schema_class.model_json_schema())
-
-
-def _gemini_model_path(model: str) -> str:
-    return model if model.startswith("models/") else f"models/{model}"
-
-
-def _strip_json_schema_keywords(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _strip_json_schema_keywords(item)
-            for key, item in value.items()
-            if key not in {"default"}
-        }
-    if isinstance(value, list):
-        return [_strip_json_schema_keywords(item) for item in value]
-    return value
-
-
-def _validate_llm_json(raw_json: str, document_type: DocumentType) -> dict[str, Any]:
-    schema_class = EXTRACTION_SCHEMAS[document_type]
-    parsed = json.loads(raw_json)
-
-    # Validate against schema (lenient — don't crash on unexpected fields)
-    try:
-        validated = schema_class.model_validate(parsed)
-        return validated.model_dump()
-    except Exception:
-        # If validation fails, return raw parsed JSON
-        return parsed
-
-
 async def extract_with_openai(
     text: str,
-    document_type: DocumentType,
+    document_type: str,
 ) -> dict[str, Any]:
     """Extract structured data using OpenAI's JSON response mode."""
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
-    schema_class = EXTRACTION_SCHEMAS[document_type]
-
-    # Truncate to ~8000 chars to stay within token limits while keeping cost low
-    truncated_text = text[:8000]
-
-    system_prompt = (
-        f"You are a document data extractor. Extract structured data from the following "
-        f"{document_type.value} document. Return a JSON object matching the schema exactly. "
-        f"If a field cannot be determined from the text, use null. "
-        f"Be precise — extract only what is explicitly stated in the document."
-    )
+    prompt = _build_extraction_prompt(text, document_type)
 
     response = await client.chat.completions.create(
         model=settings.openai_model,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": truncated_text},
+            {"role": "system", "content": "You are a professional document extractor. Output valid JSON only."},
+            {"role": "user", "content": prompt},
         ],
         response_format={"type": "json_object"},
         temperature=0,
     )
 
     raw_json = response.choices[0].message.content
-    return _validate_llm_json(raw_json, document_type)
+    return json.loads(raw_json)
 
 
 async def extract_with_gemini(
     text: str,
-    document_type: DocumentType,
+    document_type: str,
 ) -> dict[str, Any]:
-    """Extract structured data using Gemini's Generate Content REST API."""
-    schema_class = EXTRACTION_SCHEMAS[document_type]
-    schema = _json_schema_for_provider(schema_class)
+    """Extract structured data using Gemini's REST API."""
     prompt = _build_extraction_prompt(text, document_type)
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        f"{_gemini_model_path(settings.gemini_model)}:generateContent"
-    )
+    model_name = settings.gemini_model if settings.gemini_model.startswith("models/") else f"models/{settings.gemini_model}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent"
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0,
             "responseMimeType": "application/json",
-            "responseJsonSchema": schema,
         },
     }
 
@@ -300,14 +212,22 @@ async def extract_with_gemini(
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError("Gemini response did not include JSON text") from exc
 
-    return _validate_llm_json(raw_json, document_type)
+    # Clean potential markdown wrapping if present
+    cleaned = raw_json.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
+    return json.loads(cleaned.strip())
 
 
 # ══════════════════════════════════════════════════════════════
 # Regex Fallback Extraction
 # ══════════════════════════════════════════════════════════════
 
-# Common patterns
 DATE_PATTERN = re.compile(
     r"\b(\d{2,4}[/\-\.]\d{1,2}[/\-\.]\d{2,4})\b"
     r"|(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s*\d{2,4}\b)",
@@ -326,11 +246,9 @@ URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 INVOICE_NUM_PATTERN = re.compile(r"(?:invoice|inv|bill)[\s#\-.:]*([A-Z0-9\-]+)", re.IGNORECASE)
 
 
-def extract_with_regex(text: str, document_type: DocumentType) -> dict[str, Any]:
+def extract_with_regex(text: str, document_type: str) -> dict[str, Any]:
     """
     Extract data using regex patterns. This is the fallback when no LLM is available.
-
-    Not as accurate as LLM extraction, but catches common patterns reliably.
     """
     dates = [m.group() for m in DATE_PATTERN.finditer(text)]
     amounts = CURRENCY_PATTERN.findall(text)
@@ -338,11 +256,13 @@ def extract_with_regex(text: str, document_type: DocumentType) -> dict[str, Any]
     phones = PHONE_PATTERN.findall(text)
     urls = URL_PATTERN.findall(text)
 
-    if document_type == DocumentType.INVOICE:
+    doc_type_lower = (document_type or "").lower()
+
+    if doc_type_lower == "invoice":
         inv_match = INVOICE_NUM_PATTERN.search(text)
         total_match = re.search(r"(?:total\s+amount|total\s+due|\btotal\b)[\s:]*([\$€£¥]?\s*[\d,]+\.?\d*)", text, re.IGNORECASE)
         subtotal_match = re.search(r"(?:subtotal|sub-total)[\s:]*([\$€£¥]?\s*[\d,]+\.?\d*)", text, re.IGNORECASE)
-        
+
         tot_val = _parse_currency(total_match.group(1)) if total_match else (_parse_currency(amounts[-1]) if amounts else None)
         sub_val = _parse_currency(subtotal_match.group(1)) if subtotal_match else (_parse_currency(amounts[-2]) if len(amounts) >= 2 else None)
 
@@ -354,13 +274,13 @@ def extract_with_regex(text: str, document_type: DocumentType) -> dict[str, Any]
             subtotal=sub_val,
         ).model_dump()
 
-    elif document_type == DocumentType.RECEIPT:
+    elif doc_type_lower == "receipt":
         return ReceiptExtraction(
             transaction_date=dates[0] if dates else None,
             total_amount=_parse_currency(amounts[-1]) if amounts else None,
         ).model_dump()
 
-    elif document_type == DocumentType.RESUME:
+    elif doc_type_lower == "resume":
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return ResumeExtraction(
             full_name=_extract_resume_name(lines),
@@ -372,13 +292,13 @@ def extract_with_regex(text: str, document_type: DocumentType) -> dict[str, Any]
             linkedin_url=_extract_linkedin(text, urls),
         ).model_dump()
 
-    elif document_type == DocumentType.CONTRACT:
+    elif doc_type_lower == "contract":
         return ContractExtraction(
             effective_date=dates[0] if dates else None,
             contract_value=_parse_currency(amounts[0]) if amounts else None,
         ).model_dump()
 
-    # Generic fallback
+    # Generic fallback for any other custom document type
     return GenericExtraction(
         date=dates[0] if dates else None,
         amounts=[_parse_currency(a) for a in amounts if _parse_currency(a) is not None],
@@ -389,11 +309,9 @@ def extract_with_regex(text: str, document_type: DocumentType) -> dict[str, Any]
 
 
 def _parse_currency(value: str) -> float | None:
-    """Parse a currency string into a float."""
     if not value:
         return None
     try:
-        # Remove currency symbols and commas
         cleaned = re.sub(r"[^\d.]", "", value)
         return float(cleaned) if cleaned else None
     except (ValueError, TypeError):
@@ -401,7 +319,6 @@ def _parse_currency(value: str) -> float | None:
 
 
 def _extract_resume_name(lines: list[str]) -> str | None:
-    """Infer a resume name from the first content line."""
     for line in lines[:5]:
         if line.startswith("--- Page"):
             continue
@@ -486,29 +403,20 @@ def _extract_linkedin(text: str, urls: list[str]) -> str | None:
     return None
 
 
-# ══════════════════════════════════════════════════════════════
-# Main entry point
-# ══════════════════════════════════════════════════════════════
-
-
 async def extract_structured_data(
     text: str,
-    document_type: DocumentType,
+    document_type: str,
 ) -> tuple[dict[str, Any], str]:
     """
     Main extraction entry point.
-
-    Returns (extracted_data, method) where method is 'llm' or 'regex'.
     """
     if settings.llm_available:
         try:
             data = await extract_with_llm(text, document_type)
             return data, "llm"
         except Exception as e:
-            # LLM failed — fall back to regex
             data = extract_with_regex(text, document_type)
             return data, f"regex_fallback (llm error: {str(e)[:100]})"
 
-    # No LLM available — use regex
     data = extract_with_regex(text, document_type)
     return data, "regex"

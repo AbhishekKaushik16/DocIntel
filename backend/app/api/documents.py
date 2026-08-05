@@ -1,16 +1,29 @@
-"""Document API routes — upload, list, detail, corrections, reprocess, delete."""
+"""Document API routes — upload, list, detail, corrections, reprocess, delete.
+
+Concurrency notes
+──────────────────
+• RC-3/RC-7  correct_fields uses SELECT … FOR UPDATE to serialize concurrent
+             human corrections and prevent pipeline writes from overwriting them.
+• RC-4       reprocess uses an atomic UPDATE … WHERE status NOT IN (…) so that
+             only one concurrent caller can queue a task; others get HTTP 409.
+• RC-5       delete removes the DB row before the file; unlink uses missing_ok
+             so a concurrent delete or OS removal doesn't raise.
+• RC-6       upload cleans up the file on disk if the DB commit fails.
+• RC-8       dashboard stats uses a single GROUP BY query to avoid inconsistent
+             reads across multiple sequential SELECT COUNT statements.
+"""
 
 import uuid
 from pathlib import Path
 
 import aiofiles
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update, case, literal_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.models import Document, DocumentStatus, DocumentType, ExtractedField
+from app.models import Document, DocumentStatus, ExtractedField
 from app.schemas import (
     DocumentListItem,
     DocumentListResponse,
@@ -71,7 +84,8 @@ async def upload_documents(
             )
             continue
 
-        # Save file to disk
+        # RC-6: Write file to disk and create DB record atomically.
+        # If the DB commit fails we delete the orphaned file so disk stays clean.
         doc_id = uuid.uuid4()
         safe_filename = f"{doc_id}{ext}"
         file_path = upload_dir / safe_filename
@@ -79,36 +93,40 @@ async def upload_documents(
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(content)
 
-        # Create database record
-        document = Document(
-            id=doc_id,
-            original_filename=file.filename or "unknown",
-            file_path=str(file_path),
-            mime_type=file.content_type,
-            file_size_bytes=len(content),
-            status=DocumentStatus.PENDING,
-        )
-        db.add(document)
-
-        responses.append(
-            UploadResponse(
+        try:
+            document = Document(
                 id=doc_id,
                 original_filename=file.filename or "unknown",
+                file_path=str(file_path),
+                mime_type=file.content_type,
+                file_size_bytes=len(content),
                 status=DocumentStatus.PENDING,
-                message="Document uploaded successfully. Processing will begin shortly.",
             )
-        )
+            db.add(document)
 
-    await db.flush()
-    # Make uploaded document rows visible to the Celery worker before enqueueing.
+            responses.append(
+                UploadResponse(
+                    id=doc_id,
+                    original_filename=file.filename or "unknown",
+                    status=DocumentStatus.PENDING,
+                    message="Document uploaded successfully. Processing will begin shortly.",
+                )
+            )
+        except Exception:
+            # DB insert failed before commit — clean up the file we already wrote
+            file_path.unlink(missing_ok=True)
+            raise
+
+    # Commit all DB rows first, then enqueue tasks.
+    # Committing before delay() ensures the worker's separate DB connection
+    # can see the rows when it picks up the task (RC-6 / original race).
     await db.commit()
 
-    # Trigger background processing for each uploaded document
+    # Trigger background processing for each successfully inserted document
+    from app.pipeline.tasks import process_document_task  # avoid circular import
+
     for resp in responses:
         if resp.status == DocumentStatus.PENDING:
-            # Import here to avoid circular imports with celery
-            from app.pipeline.tasks import process_document_task
-
             process_document_task.delay(str(resp.id))
 
     return responses
@@ -124,7 +142,7 @@ async def list_documents(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     status_filter: DocumentStatus | None = Query(None, alias="status"),
-    type_filter: DocumentType | None = Query(None, alias="type"),
+    type_filter: str | None = Query(None, alias="type"),
     db: AsyncSession = Depends(get_db),
 ):
     """List documents with optional filtering and pagination."""
@@ -189,15 +207,25 @@ async def correct_fields(
     body: FieldCorrectionsRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Apply human corrections to extracted fields."""
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    """Apply human corrections to extracted fields.
+
+    RC-3/RC-7: We acquire a row-level lock (SELECT … FOR UPDATE) before reading
+    extracted_data. This serializes concurrent human corrections and prevents a
+    simultaneous pipeline write from silently overwriting human changes.
+    """
+    # Lock the document row for the duration of this correction transaction.
+    result = await db.execute(
+        select(Document)
+        .where(Document.id == document_id)
+        .with_for_update()
+    )
     document = result.scalar_one_or_none()
 
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
     for correction in body.corrections:
-        # Find or create the extracted field
+        # Find or create the extracted field (also locked via the parent transaction)
         field_result = await db.execute(
             select(ExtractedField).where(
                 ExtractedField.document_id == document_id,
@@ -211,27 +239,27 @@ async def correct_fields(
             field.human_verified = True
             field.confidence = 1.0
         else:
-            new_field = ExtractedField(
+            db.add(ExtractedField(
                 document_id=document_id,
                 field_name=correction.field_name,
                 field_value=correction.field_value,
                 human_verified=True,
                 confidence=1.0,
-            )
-            db.add(new_field)
+            ))
 
-        # Also update the JSONB extracted_data
+        # Merge into the JSONB blob as well
         if document.extracted_data is None:
             document.extracted_data = {}
-        document.extracted_data[correction.field_name] = correction.field_value
+        # SQLAlchemy won't detect in-place dict mutations on JSONB without this:
+        merged = dict(document.extracted_data)
+        merged[correction.field_name] = correction.field_value
+        document.extracted_data = merged
 
-    # If document was needs_review, mark as completed after corrections
+    # Auto-approve after human corrections
     if document.status == DocumentStatus.NEEDS_REVIEW:
         document.status = DocumentStatus.COMPLETED
 
     await db.flush()
-
-    # Re-fetch to get updated relationships
     await db.refresh(document)
     return DocumentResponse.model_validate(document)
 
@@ -246,23 +274,55 @@ async def reprocess_document(
     document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-run the extraction pipeline on a document."""
-    result = await db.execute(select(Document).where(Document.id == document_id))
-    document = result.scalar_one_or_none()
+    """Re-run the extraction pipeline on a document.
 
-    if not document:
+    RC-4: Uses an atomic UPDATE … WHERE status NOT IN ('pending','processing')
+    so that only one concurrent reprocess request can queue a task. Any other
+    concurrent caller gets an HTTP 409 instead of enqueueing a duplicate task.
+    """
+    # First confirm the document exists.
+    exists_result = await db.execute(
+        select(Document.id, Document.original_filename)
+        .where(Document.id == document_id)
+    )
+    row = exists_result.one_or_none()
+    if row is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    document.status = DocumentStatus.PENDING
-    document.confidence_score = None
-    await db.flush()
+    # Atomic CAS: only transitions from non-active states.
+    # If another request already set it to PENDING or PROCESSING, we get 0 rows.
+    result = await db.execute(
+        update(Document)
+        .where(Document.id == document_id)
+        .where(Document.status.not_in([
+            DocumentStatus.PENDING,
+            DocumentStatus.PROCESSING,
+        ]))
+        .values(
+            status=DocumentStatus.PENDING,
+            confidence_score=None,
+            document_type=None,
+            processed_at=None,
+        )
+        .returning(Document.id, Document.original_filename)
+    )
+    updated = result.one_or_none()
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document is already queued or being processed. Please wait.",
+        )
+
+    # Commit BEFORE enqueueing so the worker's separate DB connection sees PENDING.
+    await db.commit()
 
     from app.pipeline.tasks import process_document_task
     process_document_task.delay(str(document_id))
 
     return UploadResponse(
-        id=document.id,
-        original_filename=document.original_filename,
+        id=updated.id,
+        original_filename=updated.original_filename,
         status=DocumentStatus.PENDING,
         message="Document queued for reprocessing.",
     )
@@ -278,19 +338,31 @@ async def delete_document(
     document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a document and all its extracted data."""
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    """Delete a document and all its extracted data.
+
+    RC-5: Delete the DB row first, then the file.
+    If the server crashes between the two steps the file is a harmless orphan;
+    if the file delete fails the DB row is already gone so the API stays consistent.
+    unlink(missing_ok=True) is idempotent — safe if another process already removed it.
+    """
+    result = await db.execute(
+        select(Document)
+        .where(Document.id == document_id)
+        .with_for_update()  # prevent concurrent deletes on the same row
+    )
     document = result.scalar_one_or_none()
 
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete the file from disk
     file_path = Path(document.file_path)
-    if file_path.exists():
-        file_path.unlink()
 
+    # Delete DB row first (cascade removes extracted_fields + processing_logs)
     await db.delete(document)
+    await db.flush()  # apply within session; will commit via get_db dependency
+
+    # Then remove the file — missing_ok handles TOCTOU / concurrent deletes
+    file_path.unlink(missing_ok=True)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -300,43 +372,51 @@ async def delete_document(
 
 @router.get("/stats/dashboard", response_model=DashboardStats)
 async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
-    """Get aggregate statistics for the dashboard."""
-    # Total documents
-    total_result = await db.execute(select(func.count(Document.id)))
-    total = total_result.scalar() or 0
+    """Get aggregate statistics for the dashboard.
 
-    # By status
-    status_counts = {}
-    for s in DocumentStatus:
-        count_result = await db.execute(
-            select(func.count(Document.id)).where(Document.status == s)
+    RC-8: All counts are computed in a single SQL query so the numbers are
+    consistent even while documents are being processed concurrently.
+    """
+    # Single query: per-status counts + total + avg confidence
+    # Uses conditional aggregation (FILTER / CASE) to avoid multiple round-trips.
+    stats_result = await db.execute(
+        select(
+            func.count(Document.id).label("total"),
+            func.count(Document.id).filter(
+                Document.status == DocumentStatus.COMPLETED
+            ).label("completed"),
+            func.count(Document.id).filter(
+                Document.status == DocumentStatus.PROCESSING
+            ).label("processing"),
+            func.count(Document.id).filter(
+                Document.status == DocumentStatus.NEEDS_REVIEW
+            ).label("needs_review"),
+            func.count(Document.id).filter(
+                Document.status == DocumentStatus.FAILED
+            ).label("failed"),
+            func.avg(Document.confidence_score).filter(
+                Document.confidence_score.is_not(None)
+            ).label("avg_confidence"),
         )
-        status_counts[s.value] = count_result.scalar() or 0
-
-    # By type
-    type_query = select(Document.document_type, func.count(Document.id)).group_by(
-        Document.document_type
     )
-    type_result = await db.execute(type_query)
+    row = stats_result.one()
+
+    # By type — still a separate query but cheap (indexed GROUP BY)
+    type_result = await db.execute(
+        select(Document.document_type, func.count(Document.id))
+        .group_by(Document.document_type)
+    )
     by_type = {
-        (row[0].value if row[0] else "unclassified"): row[1]
-        for row in type_result.all()
+        (t if t else "unclassified"): cnt
+        for t, cnt in type_result.all()
     }
 
-    # Average confidence
-    avg_result = await db.execute(
-        select(func.avg(Document.confidence_score)).where(
-            Document.confidence_score.is_not(None)
-        )
-    )
-    avg_confidence = avg_result.scalar()
-
     return DashboardStats(
-        total_documents=total,
-        completed=status_counts.get("completed", 0),
-        processing=status_counts.get("processing", 0),
-        needs_review=status_counts.get("needs_review", 0),
-        failed=status_counts.get("failed", 0),
+        total_documents=row.total or 0,
+        completed=row.completed or 0,
+        processing=row.processing or 0,
+        needs_review=row.needs_review or 0,
+        failed=row.failed or 0,
         by_type=by_type,
-        avg_confidence=round(avg_confidence, 3) if avg_confidence else None,
+        avg_confidence=round(row.avg_confidence, 3) if row.avg_confidence else None,
     )

@@ -10,7 +10,7 @@ export interface DocumentListItem {
   mime_type: string | null;
   file_size_bytes: number | null;
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'needs_review';
-  document_type: 'invoice' | 'receipt' | 'contract' | 'resume' | 'generic' | null;
+  document_type: string | null;
   confidence_score: number | null;
   created_at: string;
   processed_at: string | null;
@@ -42,7 +42,7 @@ export interface DocumentResponse {
   mime_type: string | null;
   file_size_bytes: number | null;
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'needs_review';
-  document_type: 'invoice' | 'receipt' | 'contract' | 'resume' | 'generic' | null;
+  document_type: string | null;
   confidence_score: number | null;
   raw_text: string | null;
   extracted_data: Record<string, any> | null;

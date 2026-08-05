@@ -2,17 +2,27 @@
 Pipeline Orchestrator
 
 Coordinates the 4-stage processing pipeline for a single document:
-  1. Classify → 2. Parse → 3. Extract → 4. Validate
+  1. Parse → 2. Classify → 3. Extract → 4. Validate
 
-Each stage is logged to the processing_logs table for full observability.
-Handles errors gracefully — a failure in one stage doesn't crash the pipeline.
+Concurrency guarantees
+──────────────────────
+• RC-1  Atomic ownership claim: uses a single UPDATE … WHERE status IN (…) RETURNING *
+        so that only one Celery worker can transition a document from a claimable state
+        to PROCESSING. Any concurrent worker gets 0 rows and exits immediately.
+        We deliberately use ONE session for both the claim and the pipeline work to
+        avoid asyncpg's "Future attached to a different loop" error in Celery prefork
+        workers (asyncpg connections are pinned to the event loop they were created on).
+
+• RC-2  Idempotent field writes: before inserting extracted_fields rows, all
+        pre-existing rows for the document are deleted in the same transaction.
+        This ensures retries and reprocesses never accumulate duplicate rows.
 """
 
 import time
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -31,6 +41,8 @@ from app.pipeline.extractor import extract_structured_data
 from app.pipeline.validator import validate_and_score
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
 async def _log_stage(
     db: AsyncSession,
     document_id: uuid.UUID,
@@ -39,47 +51,62 @@ async def _log_stage(
     duration_ms: int | None = None,
     metadata: dict | None = None,
     error_message: str | None = None,
-):
-    """Write a processing log entry."""
-    log = ProcessingLog(
+) -> None:
+    """Write a processing log entry (flushed but not committed — caller commits)."""
+    db.add(ProcessingLog(
         document_id=document_id,
         stage=stage,
         status=status,
         duration_ms=duration_ms,
         metadata_=metadata or {},
         error_message=error_message,
-    )
-    db.add(log)
+    ))
     await db.flush()
 
+
+# ── Main entry point ───────────────────────────────────────────────────────────
 
 async def process_document(document_id: str) -> None:
     """
     Run the full extraction pipeline on a document.
 
-    This is called by the Celery task worker. It opens its own
-    database session and manages the full lifecycle.
+    Called by the Celery task worker. Opens its own DB session and manages
+    the full document lifecycle.
+
+    Concurrency (RC-1): uses a single atomic UPDATE … WHERE status IN (…) RETURNING *
+    to claim the document. Only one worker transitions it to PROCESSING; any other
+    concurrent worker gets zero rows back and exits immediately.
+
+    A single session is used throughout (claim + pipeline) to avoid asyncpg's
+    'Future attached to a different loop' RuntimeError in Celery prefork workers.
     """
     doc_uuid = uuid.UUID(document_id)
 
     async with async_session_factory() as db:
         try:
-            # Fetch the document
-            result = await db.execute(select(Document).where(Document.id == doc_uuid))
-            document = result.scalar_one_or_none()
-
-            if not document:
-                return
-
-            # Mark as processing
-            document.status = DocumentStatus.PROCESSING
+            # ── RC-1: Atomic ownership claim ──────────────────────────────────
+            # Single UPDATE … RETURNING is fully atomic in Postgres (no TOCTOU).
+            # If another worker already claimed the row we get 0 rows → return.
+            claim_result = await db.execute(
+                update(Document)
+                .where(Document.id == doc_uuid)
+                .where(Document.status.in_([
+                    DocumentStatus.PENDING,
+                    DocumentStatus.FAILED,
+                    DocumentStatus.NEEDS_REVIEW,
+                ]))
+                .values(status=DocumentStatus.PROCESSING)
+                .returning(Document)
+            )
             await db.commit()
 
-            # ── Stage 1: Classify ─────────────────────────────────
-            # We need the raw text first to classify, so we parse first in practice.
-            # But we log classification after we have text.
+            document = claim_result.scalar_one_or_none()
+            if document is None:
+                # Document doesn't exist, is COMPLETED, or another worker
+                # already claimed it — nothing to do.
+                return
 
-            # ── Stage 2: Parse ────────────────────────────────────
+            # ── Stage 1: Parse ────────────────────────────────────────────────
             t0 = time.monotonic()
             await _log_stage(db, doc_uuid, PipelineStage.PARSE, StageStatus.STARTED)
 
@@ -122,7 +149,7 @@ async def process_document(document_id: str) -> None:
                 await db.commit()
                 return
 
-            # ── Stage 1 (actual): Classify ────────────────────────
+            # ── Stage 2: Classify ─────────────────────────────────────────────
             t0 = time.monotonic()
             await _log_stage(db, doc_uuid, PipelineStage.CLASSIFY, StageStatus.STARTED)
 
@@ -135,7 +162,7 @@ async def process_document(document_id: str) -> None:
                     db, doc_uuid, PipelineStage.CLASSIFY, StageStatus.COMPLETED,
                     duration_ms=duration,
                     metadata={
-                        "type": classification.document_type.value,
+                        "type": classification.document_type,
                         "confidence": classification.confidence,
                         "method": classification.method,
                     },
@@ -149,11 +176,11 @@ async def process_document(document_id: str) -> None:
                     duration_ms=duration,
                     error_message=str(e),
                 )
-                # Classification failure isn't fatal — default to GENERIC
+                # Classification failure is non-fatal — fall back to "generic"
                 document.document_type = document.document_type or "generic"
                 await db.commit()
 
-            # ── Stage 3: Extract ──────────────────────────────────
+            # ── Stage 3: Extract ──────────────────────────────────────────────
             t0 = time.monotonic()
             await _log_stage(db, doc_uuid, PipelineStage.EXTRACT, StageStatus.STARTED)
 
@@ -171,16 +198,19 @@ async def process_document(document_id: str) -> None:
                     metadata={"method": extraction_method},
                 )
 
-                # Normalize extracted fields into the fields table
+                # RC-2: Delete stale extracted_fields before inserting new ones
+                # so retries never accumulate duplicate rows.
+                await db.execute(
+                    delete(ExtractedField).where(ExtractedField.document_id == doc_uuid)
+                )
                 for field_name, field_value in extracted_data.items():
                     if field_value is not None and not isinstance(field_value, (list, dict)):
-                        ef = ExtractedField(
+                        db.add(ExtractedField(
                             document_id=doc_uuid,
                             field_name=field_name,
                             field_value=str(field_value),
                             field_type=type(field_value).__name__,
-                        )
-                        db.add(ef)
+                        ))
 
                 await db.commit()
 
@@ -195,7 +225,7 @@ async def process_document(document_id: str) -> None:
                 await db.commit()
                 return
 
-            # ── Stage 4: Validate ─────────────────────────────────
+            # ── Stage 4: Validate ─────────────────────────────────────────────
             t0 = time.monotonic()
             await _log_stage(db, doc_uuid, PipelineStage.VALIDATE, StageStatus.STARTED)
 
@@ -210,7 +240,6 @@ async def process_document(document_id: str) -> None:
 
                 document.confidence_score = validation.confidence_score
 
-                # Route based on confidence
                 if validation.confidence_score >= settings.confidence_auto_approve:
                     document.status = DocumentStatus.COMPLETED
                 elif validation.confidence_score >= settings.confidence_review_threshold:
@@ -246,12 +275,12 @@ async def process_document(document_id: str) -> None:
                 document.processed_at = datetime.now(timezone.utc)
                 await db.commit()
 
-            # ── Update search vector ──────────────────────────────
-            # Build search text from raw_text + extracted field values
+            # ── Update full-text search vector ────────────────────────────────
+            # Non-fatal: failure here does not affect document status.
             try:
                 search_parts = [document.raw_text or ""]
                 if document.extracted_data:
-                    for k, v in document.extracted_data.items():
+                    for v in document.extracted_data.values():
                         if isinstance(v, str):
                             search_parts.append(v)
                         elif isinstance(v, list):
@@ -264,27 +293,29 @@ async def process_document(document_id: str) -> None:
                                         if val and isinstance(val, str)
                                     )
 
-                search_text = " ".join(search_parts)
-
-                # Update search_vector using raw SQL for tsvector
-                from sqlalchemy import text
                 await db.execute(
                     text(
-                        "UPDATE documents SET search_vector = to_tsvector('english', :text) "
+                        "UPDATE documents SET search_vector = to_tsvector('english', :txt) "
                         "WHERE id = :doc_id"
                     ),
-                    {"text": search_text[:100000], "doc_id": str(doc_uuid)},
+                    {"txt": " ".join(search_parts)[:100_000], "doc_id": str(doc_uuid)},
                 )
                 await db.commit()
             except Exception:
-                # Search vector update failure is non-fatal
-                pass
+                pass  # Non-fatal — search index may be stale but data is safe
 
-        except Exception as e:
-            # Catch-all: mark as failed
+        except Exception:
+            # Catch-all safety net: ensure document never stays PROCESSING forever.
             try:
-                document.status = DocumentStatus.FAILED
-                document.processed_at = datetime.now(timezone.utc)
+                await db.execute(
+                    update(Document)
+                    .where(Document.id == doc_uuid)
+                    .where(Document.status == DocumentStatus.PROCESSING)
+                    .values(
+                        status=DocumentStatus.FAILED,
+                        processed_at=datetime.now(timezone.utc),
+                    )
+                )
                 await db.commit()
             except Exception:
                 pass

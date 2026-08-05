@@ -1,29 +1,30 @@
 """
 Stage 1: Document Classifier
 
-Determines the document type (invoice, receipt, contract, resume, generic)
-using a two-pass approach:
-  1. Fast heuristic pass (keyword + structure analysis)
-  2. LLM classification fallback for ambiguous documents
+Determines the document type using a two-pass approach:
+  1. Fast heuristic pass (keyword + structure analysis for common types)
+  2. Flexible LLM classification fallback for dynamic, open-ended classification
 """
 
+import json
 import re
 from dataclasses import dataclass
 
-from app.models.document import DocumentType
+from app.config import settings
 
 
 @dataclass
 class ClassificationResult:
     """Result of document classification."""
-    document_type: DocumentType
+
+    document_type: str
     confidence: float
     method: str  # "heuristic" or "llm"
 
 
-# Keyword patterns for each document type (case-insensitive)
-KEYWORD_PATTERNS: dict[DocumentType, list[str]] = {
-    DocumentType.INVOICE: [
+# Keyword patterns for common document types (case-insensitive)
+KEYWORD_PATTERNS: dict[str, list[str]] = {
+    "invoice": [
         r"\binvoice\b", r"\binv[\s#\-.:]*\d+", r"\bbill\s+to\b",
         r"\btotal\s+due\b", r"\bamount\s+due\b", r"\bpayment\s+terms\b",
         r"\bdue\s+date\b", r"\bsubtotal\b", r"\btax\b.*\bamount\b",
@@ -33,19 +34,19 @@ KEYWORD_PATTERNS: dict[DocumentType, list[str]] = {
         r"\border\s+number\b", r"\bgst\s+registration\s+no\b",
         r"\bpan\s+no\b",
     ],
-    DocumentType.RECEIPT: [
+    "receipt": [
         r"\breceipt\b", r"\btransaction\b", r"\bpaid\b",
         r"\bchange\s+due\b", r"\bcard\s+ending\b", r"\btotal\s*[:$]",
         r"\bsubtotal\s*[:$]", r"\bthank\s+you\s+for\s+your\s+purchase\b",
         r"\bstore\s*#", r"\bcashier\b",
     ],
-    DocumentType.CONTRACT: [
+    "contract": [
         r"\bagreement\b", r"\bcontract\b", r"\bterms\s+and\s+conditions\b",
         r"\bhereby\b", r"\bwhereas\b", r"\bparty\b.*\bparty\b",
         r"\beffective\s+date\b", r"\btermination\b", r"\bclause\b",
         r"\bsignature\b", r"\bexecuted\b", r"\bindemnif",
     ],
-    DocumentType.RESUME: [
+    "resume": [
         r"\bresume\b", r"\bcurriculum\s+vitae\b", r"\bcv\b",
         r"\bwork\s+experience\b", r"\beducation\b.*\buniversity\b",
         r"\bskills\b", r"\bemployment\s+history\b", r"\bprofessional\s+summary\b",
@@ -67,14 +68,14 @@ def classify_by_heuristic(text: str) -> ClassificationResult:
     """
     if not text or not text.strip():
         return ClassificationResult(
-            document_type=DocumentType.GENERIC,
+            document_type="generic",
             confidence=0.3,
             method="heuristic",
         )
 
     text_lower = text.lower()
-    scores: dict[DocumentType, float] = {}
-    match_counts: dict[DocumentType, int] = {}
+    scores: dict[str, float] = {}
+    match_counts: dict[str, int] = {}
 
     for doc_type, patterns in KEYWORD_PATTERNS.items():
         matches = sum(1 for p in patterns if re.search(p, text_lower))
@@ -83,7 +84,7 @@ def classify_by_heuristic(text: str) -> ClassificationResult:
 
     if not scores:
         return ClassificationResult(
-            document_type=DocumentType.GENERIC,
+            document_type="generic",
             confidence=0.3,
             method="heuristic",
         )
@@ -94,25 +95,24 @@ def classify_by_heuristic(text: str) -> ClassificationResult:
 
     # Retail tax invoices often say "Tax Invoice/Bill of Supply" and contain
     # order/GST identifiers instead of classic "amount due" wording.
-    if best_type == DocumentType.INVOICE and best_matches >= 3:
+    if best_type == "invoice" and best_matches >= 3:
         return ClassificationResult(
-            document_type=DocumentType.INVOICE,
+            document_type="invoice",
             confidence=min(0.9, 0.45 + best_matches * 0.08),
             method="heuristic",
         )
 
     # Resumes often omit the literal word "resume"; a couple of strong section
     # signals are enough to identify them.
-    if best_type == DocumentType.RESUME and best_matches >= 2:
+    if best_type == "resume" and best_matches >= 2:
         return ClassificationResult(
-            document_type=DocumentType.RESUME,
+            document_type="resume",
             confidence=min(0.85, 0.45 + best_matches * 0.1),
             method="heuristic",
         )
 
     # If no type scored above threshold, classify as generic
     if best_score < HEURISTIC_CONFIDENCE_THRESHOLD:
-        # Check if there's at least some signal
         if best_score > 0.2:
             return ClassificationResult(
                 document_type=best_type,
@@ -120,7 +120,7 @@ def classify_by_heuristic(text: str) -> ClassificationResult:
                 method="heuristic",
             )
         return ClassificationResult(
-            document_type=DocumentType.GENERIC,
+            document_type="generic",
             confidence=0.4,
             method="heuristic",
         )
@@ -134,83 +134,98 @@ def classify_by_heuristic(text: str) -> ClassificationResult:
 
 async def classify_by_llm(text: str) -> ClassificationResult:
     """
-    Classify a document using LLM when heuristic is ambiguous.
-
-    Uses a short, focused prompt to minimize token usage.
+    Classify a document using LLM for open-ended, dynamic document classification.
     """
-    from app.config import settings
-
     if not settings.llm_available:
-        # Fall back to generic if LLM is not available
         return ClassificationResult(
-            document_type=DocumentType.GENERIC,
+            document_type="generic",
             confidence=0.3,
             method="heuristic_fallback",
         )
 
+    truncated_text = text[:3000]
+    prompt = (
+        "You are an expert document classifier. Analyze the text below and classify it into a specific, "
+        "lowercase snake_case document type (e.g. invoice, receipt, contract, resume, bank_statement, "
+        "tax_return, medical_report, bill_of_lading, purchase_order, utility_bill, lease_agreement, etc.).\n\n"
+        "Return a JSON object with keys:\n"
+        "- \"document_type\": string (lowercase snake_case)\n"
+        "- \"confidence\": float (0.0 to 1.0)\n\n"
+        f"Document snippet:\n{truncated_text}"
+    )
+
     try:
-        from openai import AsyncOpenAI
+        provider = settings.llm_provider.lower()
+        if provider == "openai":
+            from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+            client = AsyncOpenAI(api_key=settings.openai_api_key)
+            response = await client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            raw_json = response.choices[0].message.content
+        elif provider == "gemini":
+            import httpx
 
-        # Use only the first ~2000 chars to minimize cost
-        truncated_text = text[:2000]
-
-        response = await client.chat.completions.create(
-            model=settings.openai_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a document classifier. Classify the document into exactly one of: "
-                        "invoice, receipt, contract, resume, generic. "
-                        "Respond with ONLY the type name in lowercase, nothing else."
-                    ),
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/"
+                f"{settings.gemini_model if settings.gemini_model.startswith('models/') else 'models/' + settings.gemini_model}:generateContent"
+            )
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
                 },
-                {
-                    "role": "user",
-                    "content": f"Classify this document:\n\n{truncated_text}",
-                },
-            ],
-            temperature=0,
-            max_tokens=10,
-        )
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": settings.gemini_api_key,
+                    },
+                    json=payload,
+                )
+                resp.raise_for_status()
+                raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            return classify_by_heuristic(text)
 
-        type_str = response.choices[0].message.content.strip().lower()
-
-        # Map response to enum
-        type_map = {t.value: t for t in DocumentType}
-        doc_type = type_map.get(type_str, DocumentType.GENERIC)
+        data = json.loads(raw_json)
+        doc_type = str(data.get("document_type", "generic")).strip().lower().replace(" ", "_")
+        conf = float(data.get("confidence", 0.85))
+        conf = max(0.0, min(1.0, conf))
 
         return ClassificationResult(
-            document_type=doc_type,
-            confidence=0.85,
+            document_type=doc_type or "generic",
+            confidence=conf,
             method="llm",
         )
-
     except Exception:
-        # LLM failed — fall back to heuristic result
         return classify_by_heuristic(text)
 
 
 async def classify_document(text: str) -> ClassificationResult:
     """
     Main classification entry point.
-
-    Strategy:
-    1. Try heuristic classification first (fast, free)
-    2. If confidence is low, escalate to LLM (slower, costs tokens)
     """
     heuristic_result = classify_by_heuristic(text)
 
-    if heuristic_result.confidence >= HEURISTIC_CONFIDENCE_THRESHOLD:
+    # If heuristic matched a specific type (invoice, receipt, contract, resume) with high confidence, use it
+    if (
+        heuristic_result.confidence >= HEURISTIC_CONFIDENCE_THRESHOLD
+        and heuristic_result.document_type != "generic"
+    ):
         return heuristic_result
 
-    # Heuristic wasn't confident enough — try LLM
-    llm_result = await classify_by_llm(text)
-
-    # Return whichever is more confident
-    if llm_result.confidence > heuristic_result.confidence:
-        return llm_result
+    # Otherwise escalate to LLM for open-ended, dynamic document type classification
+    if settings.llm_available:
+        llm_result = await classify_by_llm(text)
+        if llm_result.document_type != "generic" or heuristic_result.document_type == "generic":
+            return llm_result
 
     return heuristic_result

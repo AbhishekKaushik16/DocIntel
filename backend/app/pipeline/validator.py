@@ -3,14 +3,10 @@ Stage 4: Validator & Confidence Scorer
 
 Validates extracted data and computes a composite confidence score.
 Routes documents to completed/needs_review/failed based on thresholds.
-
-This is the "hard sub-problem most people skip" — our depth differentiator.
 """
 
 from dataclasses import dataclass, field
 from typing import Any
-
-from app.models.document import DocumentType
 
 
 @dataclass
@@ -31,42 +27,42 @@ class ValidationResult:
     extraction_method_score: float = 0.0
 
 
-# ── Field importance weights per document type ──────────────────
+# ── Field importance weights per known document type ──────────────────
 
-REQUIRED_FIELDS: dict[DocumentType, list[str]] = {
-    DocumentType.INVOICE: [
+REQUIRED_FIELDS: dict[str, list[str]] = {
+    "invoice": [
         "invoice_number", "invoice_date", "vendor_name", "total_amount",
     ],
-    DocumentType.RECEIPT: [
+    "receipt": [
         "store_name", "transaction_date", "total_amount",
     ],
-    DocumentType.CONTRACT: [
+    "contract": [
         "contract_title", "parties", "effective_date",
     ],
-    DocumentType.RESUME: [
+    "resume": [
         "full_name", "email", "work_experience",
     ],
-    DocumentType.GENERIC: [
+    "generic": [
         "summary",
     ],
 }
 
-OPTIONAL_FIELDS: dict[DocumentType, list[str]] = {
-    DocumentType.INVOICE: [
+OPTIONAL_FIELDS: dict[str, list[str]] = {
+    "invoice": [
         "due_date", "vendor_address", "bill_to_name", "bill_to_address",
         "line_items", "subtotal", "tax_amount", "currency", "payment_terms",
     ],
-    DocumentType.RECEIPT: [
+    "receipt": [
         "store_address", "transaction_id", "items", "subtotal",
         "tax_amount", "payment_method",
     ],
-    DocumentType.CONTRACT: [
+    "contract": [
         "expiration_date", "contract_value", "key_terms", "governing_law", "summary",
     ],
-    DocumentType.RESUME: [
+    "resume": [
         "phone", "location", "summary", "skills", "education", "linkedin_url",
     ],
-    DocumentType.GENERIC: [
+    "generic": [
         "title", "author", "date", "key_entities", "amounts", "emails",
     ],
 }
@@ -85,45 +81,56 @@ def _is_field_present(value: Any) -> bool:
 
 def compute_field_completeness(
     extracted_data: dict[str, Any],
-    document_type: DocumentType,
+    document_type: str,
 ) -> tuple[float, list[ValidationIssue]]:
     """
-    Compute what percentage of expected fields were extracted.
+    Compute what percentage of fields were extracted.
 
-    Required fields are weighted 2x compared to optional fields.
+    For known types, uses weighted required/optional field rules.
+    For custom/dynamic types, calculates non-null fields over total extracted fields.
     """
     issues = []
-    required = REQUIRED_FIELDS.get(document_type, [])
-    optional = OPTIONAL_FIELDS.get(document_type, [])
+    doc_type_lower = (document_type or "").lower()
 
-    required_present = 0
-    for f in required:
-        if _is_field_present(extracted_data.get(f)):
-            required_present += 1
-        else:
-            issues.append(ValidationIssue(
-                field=f,
-                severity="warning",
-                message=f"Required field '{f}' is missing or empty",
-            ))
+    if (doc_type_lower in REQUIRED_FIELDS or doc_type_lower in OPTIONAL_FIELDS) and not (
+        doc_type_lower == "generic" and extracted_data and "summary" not in extracted_data
+    ):
+        required = REQUIRED_FIELDS.get(doc_type_lower, [])
+        optional = OPTIONAL_FIELDS.get(doc_type_lower, [])
 
-    optional_present = sum(1 for f in optional if _is_field_present(extracted_data.get(f)))
+        required_present = 0
+        for f in required:
+            if _is_field_present(extracted_data.get(f)):
+                required_present += 1
+            else:
+                issues.append(ValidationIssue(
+                    field=f,
+                    severity="warning",
+                    message=f"Required field '{f}' is missing or empty",
+                ))
 
-    total_weight = len(required) * 2 + len(optional)
-    present_weight = required_present * 2 + optional_present
+        optional_present = sum(1 for f in optional if _is_field_present(extracted_data.get(f)))
 
-    score = present_weight / total_weight if total_weight > 0 else 0.5
+        total_weight = len(required) * 2 + len(optional)
+        present_weight = required_present * 2 + optional_present
+
+        score = present_weight / total_weight if total_weight > 0 else 0.5
+        return score, issues
+
+    # Dynamic/custom document types
+    if not extracted_data:
+        return 0.0, [ValidationIssue(field="_all", severity="error", message="No structured fields extracted")]
+
+    total_keys = len(extracted_data)
+    present_keys = sum(1 for v in extracted_data.values() if _is_field_present(v))
+    score = present_keys / total_keys if total_keys > 0 else 0.5
+
     return score, issues
 
 
 def cross_validate_invoice(data: dict[str, Any]) -> tuple[float, list[ValidationIssue]]:
     """
     Cross-field validation for invoices.
-
-    Checks:
-    - total_amount ≈ subtotal + tax_amount
-    - total_amount ≈ sum(line_items.amount)
-    - due_date >= invoice_date
     """
     issues = []
     checks_passed = 0
@@ -170,7 +177,6 @@ def cross_validate_invoice(data: dict[str, Any]) -> tuple[float, list[Validation
     due_date = data.get("due_date")
     if invoice_date and due_date:
         checks_total += 1
-        # Simple string comparison works for ISO dates; best-effort for others
         try:
             if due_date >= invoice_date:
                 checks_passed += 1
@@ -181,38 +187,32 @@ def cross_validate_invoice(data: dict[str, Any]) -> tuple[float, list[Validation
                     message=f"Due date ({due_date}) is before invoice date ({invoice_date}).",
                 ))
         except Exception:
-            pass  # Skip if dates aren't comparable
+            pass
 
-    score = checks_passed / checks_total if checks_total > 0 else 0.7  # Neutral if no checks possible
+    score = checks_passed / checks_total if checks_total > 0 else 0.7
     return score, issues
 
 
 def cross_validate(
     extracted_data: dict[str, Any],
-    document_type: DocumentType,
+    document_type: str,
 ) -> tuple[float, list[ValidationIssue]]:
     """Route to type-specific cross-validation."""
-    if document_type == DocumentType.INVOICE:
+    doc_type_lower = (document_type or "").lower()
+    if doc_type_lower == "invoice":
         return cross_validate_invoice(extracted_data)
 
-    # For other types, return neutral score (no cross-validation rules yet)
     return 0.7, []
 
 
 def validate_and_score(
     extracted_data: dict[str, Any],
-    document_type: DocumentType,
+    document_type: str,
     extraction_method: str,
     parse_warnings: list[str] | None = None,
 ) -> ValidationResult:
     """
     Main validation entry point.
-
-    Computes a composite confidence score from:
-    1. Field completeness (40% weight)
-    2. Cross-field validation (30% weight)
-    3. Extraction method quality (20% weight)
-    4. Parse quality (10% weight)
     """
     all_issues = []
 
@@ -237,7 +237,6 @@ def validate_and_score(
     # 4. Parse quality
     parse_score = 1.0
     if parse_warnings:
-        # Deduct for each warning
         parse_score = max(0.3, 1.0 - 0.15 * len(parse_warnings))
         for w in parse_warnings:
             all_issues.append(ValidationIssue(
@@ -254,7 +253,6 @@ def validate_and_score(
         + parse_score * 0.10
     )
 
-    # Clamp to [0, 1]
     confidence = max(0.0, min(1.0, round(confidence, 3)))
 
     return ValidationResult(
