@@ -33,6 +33,8 @@ export interface ProcessingLog {
   duration_ms: number | null;
   metadata_: Record<string, any> | null;
   error_message: string | null;
+  reasoning: string | null;
+  agent_steps: any[] | null;
   created_at: string;
 }
 

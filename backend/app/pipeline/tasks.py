@@ -46,15 +46,16 @@ celery_app.conf.update(
 
 # ── Async bridge ───────────────────────────────────────────────────────────────
 
+_worker_loop = None
+
 def _run_async(coro):
-    """Run an async coroutine in a fresh event loop (Celery worker bridge)."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
-        asyncio.set_event_loop(None)
+    """Run an async coroutine in a global event loop (Celery worker bridge)."""
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+    
+    return _worker_loop.run_until_complete(coro)
 
 
 # ── Transient error types that warrant a retry ────────────────────────────────

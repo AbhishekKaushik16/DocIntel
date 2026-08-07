@@ -39,6 +39,9 @@ class ProcessingLogResponse(BaseModel):
     duration_ms: int | None
     metadata_: dict[str, Any] | None = Field(alias="metadata_")
     error_message: str | None
+    # Agentic fields: why the agent made this decision + its tool-call trace
+    reasoning: str | None = None
+    agent_steps: list[dict[str, Any]] | None = None
     created_at: datetime
 
 

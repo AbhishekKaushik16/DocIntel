@@ -75,6 +75,7 @@ class PipelineStage(str, enum.Enum):
     PARSE = "parse"
     EXTRACT = "extract"
     VALIDATE = "validate"
+    RESOLVE = "resolve"  # Agentic resolver stage: fires when validation finds fixable errors
 
 
 class StageStatus(str, enum.Enum):
@@ -202,6 +203,9 @@ class ProcessingLog(Base):
     duration_ms = Column(Integer, nullable=True)
     metadata_ = Column("metadata", JSONType, nullable=True, default=dict)
     error_message = Column(Text, nullable=True)
+    # Agentic fields: why the agent made this decision and the full tool-call trace
+    reasoning = Column(Text, nullable=True)
+    agent_steps = Column(JSONType, nullable=True)  # list of {tool, input, output} dicts
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

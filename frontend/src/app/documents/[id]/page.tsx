@@ -4,6 +4,7 @@ import { useEffect, useState, use } from 'react';
 import Link from 'next/link';
 import StatusBadge from '@/components/StatusBadge';
 import FieldEditor from '@/components/FieldEditor';
+import AgentTraceViewer from '@/components/AgentTraceViewer';
 import { getDocument, reprocessDocument, DocumentResponse } from '@/lib/api';
 import { ArrowLeft, RefreshCw, FileText, CheckCircle, AlertTriangle, Cpu, ListChecks } from 'lucide-react';
 
@@ -176,6 +177,14 @@ export default function DocumentDetailPage({ params }: { params: Promise<{ id: s
                       <pre className="text-[10px] text-gray-400 bg-[#0b0f19] p-2 rounded overflow-x-auto">
                         {JSON.stringify(log.metadata_, null, 2)}
                       </pre>
+                    )}
+                    
+                    {/* Inject AgentTraceViewer for Reasoning & Steps */}
+                    {(log.reasoning || (log.agent_steps && log.agent_steps.length > 0)) && (
+                      <AgentTraceViewer 
+                        reasoning={log.reasoning}
+                        agentSteps={log.agent_steps}
+                      />
                     )}
                   </div>
                 ))}

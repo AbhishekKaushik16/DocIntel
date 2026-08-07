@@ -26,9 +26,15 @@ class Settings(BaseSettings):
     # --- LLM ---
     llm_provider: str = "openai"
     openai_api_key: str = ""
+    # Fast/cheap model — used by the Classifier Agent (high volume, latency-sensitive)
     openai_model: str = "gpt-4o-mini"
+    # Strong reasoning model — used by the Resolver Agent (low volume, quality-critical)
+    openai_strong_model: str = "gpt-4o"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-flash-latest"
+    # Fast model for classification
+    gemini_model: str = "gemini-2.0-flash"
+    # Strong model for resolution (Gemini 2.5 Pro or similar)
+    gemini_strong_model: str = "gemini-2.5-pro"
     llm_enabled: bool = True  # If False or no API key, falls back to regex extraction
 
     # --- CORS ---
@@ -54,7 +60,28 @@ class Settings(BaseSettings):
             return bool(self.gemini_api_key)
         return False
 
+    @property
+    def fast_model_name(self) -> str:
+        """Fast/cheap model name for the current provider (Classifier Agent)."""
+        provider = self.llm_provider.lower()
+        if provider == "openai":
+            return self.openai_model
+        if provider == "gemini":
+            return self.gemini_model
+        return self.openai_model
+
+    @property
+    def strong_model_name(self) -> str:
+        """Strong reasoning model name for the current provider (Resolver Agent)."""
+        provider = self.llm_provider.lower()
+        if provider == "openai":
+            return self.openai_strong_model
+        if provider == "gemini":
+            return self.gemini_strong_model
+        return self.openai_strong_model
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
 
 
 settings = Settings()
