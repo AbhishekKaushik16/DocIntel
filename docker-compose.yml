@@ -29,6 +29,24 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── Elasticsearch ──────────────────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.15.0
+    container_name: docintel-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # ── Backend API ───────────────────────────────────────────────
   backend:
     build:
@@ -52,6 +70,8 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
+      GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3.5-flash}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
       DEBUG: "true"
     depends_on:
       postgres:
@@ -79,6 +99,8 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
+      GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3.5-flash}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,3 +128,4 @@ services:
 volumes:
   postgres_data:
   upload_data:
+  es_data:

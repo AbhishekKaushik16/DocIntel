@@ -395,107 +395,80 @@ async def _run_openai_agent(file_path: str) -> ClassificationResult:
 
 
 async def _run_gemini_agent(file_path: str) -> ClassificationResult:
-    """
-    Run the Classifier Agent using the Gemini REST API with function calling.
-    We hand-roll the tool loop because the Gemini SDK isn't in our deps.
-    """
-    model = settings.fast_model_name
-    if not model.startswith("models/"):
-        model = f"models/{model}"
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": settings.gemini_api_key}
-
-    contents = [
-        {
-            "role": "user",
-            "parts": [{"text": f"{SYSTEM_PROMPT}\n\nPlease classify this document: {file_path}"}],
-        }
+    """Run the Classifier Agent using LangChain with Gemini."""
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+    
+    llm = ChatGoogleGenerativeAI(
+        model=settings.fast_model_name,
+        google_api_key=settings.gemini_api_key,
+        temperature=0,
+    )
+    llm_with_tools = llm.bind_tools(TOOL_SPECS)
+    
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=f"Please classify this document: {file_path}")
     ]
     agent_steps: list[dict] = []
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        for round_num in range(MAX_TOOL_ROUNDS):
-            payload = {
-                "contents": contents,
-                "tools": [GEMINI_TOOL_SPECS],
-                "generationConfig": {"temperature": 0},
-            }
-            # Retry on transient errors (429 rate limit, 503 unavailable)
-            resp = None
-            for attempt in range(MAX_RETRIES):
+    for round_num in range(MAX_TOOL_ROUNDS):
+        response = None
+        for attempt in range(MAX_RETRIES):
+            try:
                 await throttle_gemini_request()
-                resp = await client.post(url, headers=headers, json=payload)
-                if resp.status_code not in (429, 503):
-                    break
+                response = await llm_with_tools.ainvoke(messages)
+                break
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
+                    raise
                 await _sleep_backoff(attempt)
-            resp.raise_for_status()
-            body = resp.json()
-
-
-            candidate = body["candidates"][0]
-            parts = candidate["content"]["parts"]
-
-            # Collect tool calls from this response
-            tool_calls_in_response = []
-            text_part = None
-            for part in parts:
-                if "functionCall" in part:
-                    tool_calls_in_response.append(part["functionCall"])
-                elif "text" in part:
-                    text_part = part["text"]
-
-            if tool_calls_in_response:
-                # Add model's response to the conversation
-                contents.append({"role": "model", "parts": parts})
-
-                # Execute each tool and add results
-                tool_response_parts = []
-                for tc in tool_calls_in_response:
-                    result = _dispatch_tool(tc["name"], tc.get("args", {}))
-                    agent_steps.append({
-                        "round": round_num + 1,
-                        "tool": tc["name"],
-                        "input": tc.get("args", {}),
-                        "output": result,
-                    })
-                    tool_response_parts.append({
-                        "functionResponse": {
-                            "name": tc["name"],
-                            "response": {"result": result},
-                        }
-                    })
-                contents.append({"role": "user", "parts": tool_response_parts})
-
-            elif text_part:
-                # Agent is done — parse JSON answer
-                try:
-                    raw = text_part.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("```")[1]
-                        if raw.startswith("json"):
-                            raw = raw[4:]
-                    data = json.loads(raw.strip())
-                    return ClassificationResult(
-                        document_type=str(data.get("document_type", "generic")).strip().lower().replace(" ", "_"),
-                        confidence=max(0.0, min(1.0, float(data.get("confidence", 0.85)))),
-                        method="agent_tools" if agent_steps else "agent_direct",
-                        reasoning=str(data.get("reasoning", "")),
-                        agent_steps=agent_steps,
-                    )
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    text_lower = text_part.lower()
-                    for doc_type in ["invoice", "receipt", "contract", "resume", "bank_statement"]:
-                        if doc_type in text_lower:
-                            return ClassificationResult(
-                                document_type=doc_type,
-                                confidence=0.7,
-                                method="agent_text_parse",
-                                reasoning=text_part[:300],
-                                agent_steps=agent_steps,
-                            )
-                    break
-            else:
-                break  # Unexpected response shape — stop
+        
+        if response.tool_calls:
+            messages.append(response)
+            for tool_call in response.tool_calls:
+                result = _dispatch_tool(tool_call["name"], tool_call["args"])
+                agent_steps.append({
+                    "round": round_num + 1,
+                    "tool": tool_call["name"],
+                    "input": tool_call["args"],
+                    "output": result,
+                })
+                messages.append(ToolMessage(
+                    tool_call_id=tool_call["id"],
+                    content=json.dumps(result)
+                ))
+        else:
+            # Agent is done — parse JSON answer
+            try:
+                raw_content = response.content
+                if isinstance(raw_content, list):
+                    raw_content = raw_content[0].get("text", "") if raw_content else ""
+                raw = str(raw_content).strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                data = json.loads(raw.strip())
+                return ClassificationResult(
+                    document_type=str(data.get("document_type", "generic")).strip().lower().replace(" ", "_"),
+                    confidence=max(0.0, min(1.0, float(data.get("confidence", 0.85)))),
+                    method="agent_tools" if agent_steps else "agent_direct",
+                    reasoning=str(data.get("reasoning", "")),
+                    agent_steps=agent_steps,
+                )
+            except (json.JSONDecodeError, KeyError, ValueError):
+                text_lower = str(raw_content).lower()
+                for doc_type in ["invoice", "receipt", "contract", "resume", "bank_statement"]:
+                    if doc_type in text_lower:
+                        return ClassificationResult(
+                            document_type=doc_type,
+                            confidence=0.7,
+                            method="agent_text_parse",
+                            reasoning=str(raw_content)[:300],
+                            agent_steps=agent_steps,
+                        )
+                break
 
     return ClassificationResult(
         document_type="generic",

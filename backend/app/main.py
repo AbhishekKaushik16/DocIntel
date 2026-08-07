@@ -11,6 +11,7 @@ from app.config import settings
 from app.database import init_db
 from app.api.documents import router as documents_router
 from app.api.search import router as search_router
+from app.api.query import router as query_router
 
 
 @asynccontextmanager
@@ -19,6 +20,14 @@ async def lifespan(app: FastAPI):
     # Startup: ensure upload directory exists and database tables are created
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     await init_db()
+
+    # Initialize Elasticsearch index (non-fatal)
+    try:
+        from app.elasticsearch import ensure_index
+        await ensure_index()
+    except Exception:
+        pass  # ES may not be running
+
     yield
     # Shutdown: cleanup if needed
 
@@ -42,6 +51,7 @@ app.add_middleware(
 # ── Routes ────────────────────────────────────────────────────
 app.include_router(documents_router)
 app.include_router(search_router)
+app.include_router(query_router)
 
 
 # ── Health check ──────────────────────────────────────────────

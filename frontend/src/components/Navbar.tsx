@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { FileText, Search, LayoutDashboard, AlertCircle, UploadCloud } from 'lucide-react';
+import { FileText, Search, LayoutDashboard, AlertCircle, UploadCloud, MessageSquare } from 'lucide-react';
 
 export default function Navbar() {
   const pathname = usePathname();
@@ -11,6 +11,7 @@ export default function Navbar() {
     { href: '/', label: 'Dashboard', icon: LayoutDashboard },
     { href: '/documents', label: 'Documents', icon: FileText },
     { href: '/search', label: 'Search', icon: Search },
+    { href: '/query', label: 'Ask AI', icon: MessageSquare },
   ];
 
   return (

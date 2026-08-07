@@ -1,30 +1,14 @@
 """
-Pipeline Orchestrator — Adaptive Agentic Loop
+Pipeline Orchestrator — Thin wrapper around the LangGraph pipeline.
 
-Coordinates the processing pipeline for a single document:
+Responsibilities:
+  1. Atomic ownership claim (RC-1)
+  2. Invoke the LangGraph pipeline
+  3. Persist final state to the database
+  4. Log stage transitions for observability
+  5. Index to Elasticsearch (non-fatal)
 
-  1. PARSE     — extract text from the raw file
-  2. CLASSIFY  — Classifier Agent (tool-using) determines document type
-  3. EXTRACT   — LLM extracts structured data
-  4. VALIDATE  — cross-field validation + confidence scoring
-  5. RESOLVE   — Resolver Agent attempts to fix validation failures (optional)
-  6. VALIDATE  — re-scores after resolution (one retry max)
-
-Branching logic:
-  • If VALIDATE has no actionable errors/warnings → route to COMPLETED/NEEDS_REVIEW
-  • If VALIDATE has warnings/errors → invoke RESOLVE agent
-  • After RESOLVE: re-run VALIDATE; always route based on final confidence score
-
-Agent reasoning and tool-call traces are persisted to processing_logs.reasoning
-and processing_logs.agent_steps for full observability into *why* each decision
-was made — not just what the outcome was.
-
-Concurrency guarantees
-──────────────────────
-• RC-1  Atomic ownership claim: single UPDATE … WHERE status IN (…) RETURNING *
-        One session only to avoid asyncpg "Future attached to different loop" error.
-
-• RC-2  Idempotent field writes: DELETE before INSERT in the extract stage.
+All pipeline logic (branching, retries, error handling) is now in graph.py.
 """
 
 import time
@@ -32,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, text, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -45,11 +29,7 @@ from app.models import (
     ProcessingLog,
     StageStatus,
 )
-from app.pipeline.classifier import classify_document
-from app.pipeline.parser import parse_document
-from app.pipeline.extractor import extract_structured_data
-from app.pipeline.validator import validate_and_score, ValidationResult
-from app.pipeline.resolver import resolve_validation_issues
+from app.pipeline.graph import pipeline, PipelineState
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -65,13 +45,7 @@ async def _log_stage(
     reasoning: str | None = None,
     agent_steps: list[dict] | None = None,
 ) -> None:
-    """
-    Write a processing log entry.
-
-    Flushed but not committed — caller must commit.
-    Includes 'reasoning' (agent's chain-of-thought) and 'agent_steps'
-    (full tool-call trace) for agentic stages.
-    """
+    """Write a processing log entry."""
     db.add(ProcessingLog(
         document_id=document_id,
         stage=stage,
@@ -83,21 +57,6 @@ async def _log_stage(
         agent_steps=agent_steps,
     ))
     await db.flush()
-
-
-def _issues_to_dicts(issues) -> list[dict]:
-    """Convert ValidationIssue dataclass list to JSON-serializable dicts."""
-    return [{"field": i.field, "severity": i.severity, "message": i.message} for i in issues]
-
-
-def _has_actionable_issues(validation: ValidationResult) -> bool:
-    """
-    Returns True only if there are ERROR-severity issues worth invoking the
-    Resolver Agent for. WARNING-severity issues (missing optional fields, low
-    confidence) are handled by routing to NEEDS_REVIEW directly — the Resolver
-    is reserved for fixable data errors like arithmetic mismatches.
-    """
-    return any(i.severity == "error" for i in validation.issues)
 
 
 async def _write_extracted_fields(
@@ -119,19 +78,101 @@ async def _write_extracted_fields(
             ))
 
 
+STATUS_MAP = {
+    "completed": DocumentStatus.COMPLETED,
+    "needs_review": DocumentStatus.NEEDS_REVIEW,
+    "failed": DocumentStatus.FAILED,
+}
+
+STAGE_MAP = {
+    "parse": PipelineStage.PARSE,
+    "classify": PipelineStage.CLASSIFY,
+    "extract": PipelineStage.EXTRACT,
+    "validate": PipelineStage.VALIDATE,
+    "resolve": PipelineStage.RESOLVE,
+    "re_validate": PipelineStage.VALIDATE,
+}
+
+
+async def _persist_pipeline_logs(
+    db: AsyncSession,
+    doc_uuid: uuid.UUID,
+    state: dict[str, Any],
+) -> None:
+    """Persist pipeline stage logs from the final LangGraph state."""
+    timings = state.get("stage_timings", {})
+
+    # Parse log
+    if "raw_text" in state or state.get("error", "").startswith("Parse"):
+        await _log_stage(
+            db, doc_uuid, PipelineStage.PARSE,
+            StageStatus.FAILED if state.get("error", "").startswith("Parse") or state.get("error", "").startswith("No text") else StageStatus.COMPLETED,
+            duration_ms=timings.get("parse"),
+            metadata={
+                "method": state.get("parse_method"),
+                "page_count": state.get("page_count"),
+                "warnings": state.get("parse_warnings", []),
+            },
+            error_message=state.get("error") if state.get("error", "").startswith("Parse") or state.get("error", "").startswith("No text") else None,
+        )
+
+    # Classify log
+    if "document_type" in state:
+        await _log_stage(
+            db, doc_uuid, PipelineStage.CLASSIFY, StageStatus.COMPLETED,
+            duration_ms=timings.get("classify"),
+            metadata={
+                "type": state.get("document_type"),
+                "confidence": state.get("classify_confidence"),
+                "method": state.get("classify_method"),
+            },
+            reasoning=state.get("classify_reasoning"),
+            agent_steps=state.get("classify_agent_steps"),
+        )
+
+    # Extract log
+    if "extracted_data" in state:
+        await _log_stage(
+            db, doc_uuid, PipelineStage.EXTRACT,
+            StageStatus.FAILED if state.get("error", "").startswith("Extraction") else StageStatus.COMPLETED,
+            duration_ms=timings.get("extract"),
+            metadata={"method": state.get("extraction_method")},
+            error_message=state.get("error") if state.get("error", "").startswith("Extraction") else None,
+        )
+
+    # Validate log
+    if "confidence_score" in state:
+        await _log_stage(
+            db, doc_uuid, PipelineStage.VALIDATE, StageStatus.COMPLETED,
+            duration_ms=timings.get("validate"),
+            metadata={
+                "confidence_score": state.get("confidence_score"),
+                "field_completeness": state.get("field_completeness"),
+                "cross_validation_score": state.get("cross_validation_score"),
+                "issues": state.get("validation_issues", []),
+            },
+            reasoning=f"Confidence: {state.get('confidence_score', 0):.3f}",
+        )
+
+    # Resolve log
+    if state.get("resolve_attempted"):
+        await _log_stage(
+            db, doc_uuid, PipelineStage.RESOLVE,
+            StageStatus.COMPLETED if state.get("resolve_resolved") else StageStatus.FAILED,
+            duration_ms=timings.get("resolve"),
+            metadata={"resolved": state.get("resolve_resolved")},
+            reasoning=state.get("resolve_reasoning"),
+            agent_steps=state.get("resolve_agent_steps"),
+        )
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 async def process_document(document_id: str) -> None:
     """
-    Run the adaptive extraction pipeline on a document.
+    Run the LangGraph pipeline on a document.
 
     Called by the Celery task worker. Opens its own DB session.
-
-    Stage flow:
-      PARSE → CLASSIFY (agent) → EXTRACT → VALIDATE
-        └─ if issues → RESOLVE (agent) → VALIDATE (retry)
-
-    All agent reasoning and tool traces are stored in processing_logs.
     """
     doc_uuid = uuid.UUID(document_id)
 
@@ -152,288 +193,39 @@ async def process_document(document_id: str) -> None:
             await db.commit()
 
             document = claim_result.scalar_one_or_none()
-            print(f"[DEBUG ORCHESTRATOR] ID={doc_uuid}, claimed document={document}")
             if document is None:
-                # DEBUG WHY IT'S NONE
-                debug_res = await db.execute(select(Document.status).where(Document.id == doc_uuid))
-                status = debug_res.scalar_one_or_none()
-                print(f"[DEBUG ORCHESTRATOR] Current status in DB: {status}")
                 return
 
-            # ── Stage 1: Parse ────────────────────────────────────────────────
-            t0 = time.monotonic()
-            await _log_stage(db, doc_uuid, PipelineStage.PARSE, StageStatus.STARTED)
+            # ── Invoke LangGraph pipeline ─────────────────────────────────────
+            initial_state: PipelineState = {
+                "document_id": document_id,
+                "file_path": str(document.file_path),
+            }
 
-            try:
-                parse_result = await parse_document(document.file_path)
-                duration = int((time.monotonic() - t0) * 1000)
+            final_state = await pipeline.ainvoke(initial_state)
 
-                if not parse_result.text.strip():
-                    await _log_stage(
-                        db, doc_uuid, PipelineStage.PARSE, StageStatus.FAILED,
-                        duration_ms=duration,
-                        error_message="No text could be extracted from the document.",
-                        metadata={"warnings": parse_result.warnings},
-                    )
-                    document.status = DocumentStatus.FAILED
-                    await db.commit()
-                    return
+            # ── Persist results to DB ─────────────────────────────────────────
 
-                document.raw_text = parse_result.text
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.PARSE, StageStatus.COMPLETED,
-                    duration_ms=duration,
-                    metadata={
-                        "method": parse_result.method,
-                        "page_count": parse_result.page_count,
-                        "warnings": parse_result.warnings,
-                        "parser_metadata": parse_result.metadata,
-                    },
-                )
-                await db.commit()
+            # Update document fields
+            if final_state.get("raw_text"):
+                document.raw_text = final_state["raw_text"]
+            if final_state.get("document_type"):
+                document.document_type = final_state["document_type"]
+            if final_state.get("extracted_data"):
+                document.extracted_data = final_state["extracted_data"]
+                await _write_extracted_fields(db, doc_uuid, final_state["extracted_data"])
+            if final_state.get("confidence_score") is not None:
+                document.confidence_score = final_state["confidence_score"]
 
-            except Exception as e:
-                duration = int((time.monotonic() - t0) * 1000)
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.PARSE, StageStatus.FAILED,
-                    duration_ms=duration,
-                    error_message=str(e),
-                )
-                document.status = DocumentStatus.FAILED
-                await db.commit()
-                return
+            # Set final status
+            final_status = final_state.get("final_status", "failed")
+            document.status = STATUS_MAP.get(final_status, DocumentStatus.FAILED)
+            document.processed_at = datetime.now(timezone.utc)
 
-            # ── Stage 2: Classify (Agent) ─────────────────────────────────────
-            # The Classifier Agent uses tools (check_file_metadata, sample_page_text,
-            # run_ocr_preview) iteratively before committing to a document type.
-            # Its reasoning and tool-call trace are persisted to processing_logs.
-            t0 = time.monotonic()
-            await _log_stage(db, doc_uuid, PipelineStage.CLASSIFY, StageStatus.STARTED)
+            # Persist stage logs
+            await _persist_pipeline_logs(db, doc_uuid, final_state)
 
-            try:
-                # Pass file_path, not text — the agent decides how much to sample
-                classification = await classify_document(document.file_path)
-                duration = int((time.monotonic() - t0) * 1000)
-
-                document.document_type = classification.document_type
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.CLASSIFY, StageStatus.COMPLETED,
-                    duration_ms=duration,
-                    metadata={
-                        "type": classification.document_type,
-                        "confidence": classification.confidence,
-                        "method": classification.method,
-                        "tool_rounds": len(classification.agent_steps),
-                    },
-                    reasoning=classification.reasoning,
-                    agent_steps=classification.agent_steps,
-                )
-                await db.commit()
-
-            except Exception as e:
-                duration = int((time.monotonic() - t0) * 1000)
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.CLASSIFY, StageStatus.FAILED,
-                    duration_ms=duration,
-                    error_message=str(e),
-                    reasoning="Classifier agent failed; falling back to 'generic' type.",
-                )
-                document.document_type = document.document_type or "generic"
-                await db.commit()
-
-            # ── Stage 3: Extract ──────────────────────────────────────────────
-            t0 = time.monotonic()
-            await _log_stage(db, doc_uuid, PipelineStage.EXTRACT, StageStatus.STARTED)
-
-            try:
-                extracted_data, extraction_method = await extract_structured_data(
-                    parse_result.text,
-                    document.document_type,
-                    file_path=str(document.file_path),
-                )
-                duration = int((time.monotonic() - t0) * 1000)
-
-                document.extracted_data = extracted_data
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.EXTRACT, StageStatus.COMPLETED,
-                    duration_ms=duration,
-                    metadata={"method": extraction_method},
-                )
-
-                await _write_extracted_fields(db, doc_uuid, extracted_data)
-                await db.commit()
-
-            except Exception as e:
-                duration = int((time.monotonic() - t0) * 1000)
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.EXTRACT, StageStatus.FAILED,
-                    duration_ms=duration,
-                    error_message=str(e),
-                )
-                document.status = DocumentStatus.FAILED
-                await db.commit()
-                return
-
-            # ── Stage 4: Validate ─────────────────────────────────────────────
-            t0 = time.monotonic()
-            await _log_stage(db, doc_uuid, PipelineStage.VALIDATE, StageStatus.STARTED)
-
-            try:
-                validation = validate_and_score(
-                    extracted_data=extracted_data,
-                    document_type=document.document_type,
-                    extraction_method=extraction_method,
-                    parse_warnings=parse_result.warnings,
-                )
-                duration = int((time.monotonic() - t0) * 1000)
-
-                issues_dicts = _issues_to_dicts(validation.issues)
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.VALIDATE, StageStatus.COMPLETED,
-                    duration_ms=duration,
-                    metadata={
-                        "confidence_score": validation.confidence_score,
-                        "field_completeness": validation.field_completeness,
-                        "cross_validation_score": validation.cross_validation_score,
-                        "issues": issues_dicts,
-                    },
-                    reasoning=(
-                        f"Validation found {len(issues_dicts)} issue(s). "
-                        f"Confidence: {validation.confidence_score:.3f}. "
-                        + ("Will invoke Resolver Agent." if _has_actionable_issues(validation) else "No actionable issues.")
-                    ),
-                )
-                await db.commit()
-
-            except Exception as e:
-                duration = int((time.monotonic() - t0) * 1000)
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.VALIDATE, StageStatus.FAILED,
-                    duration_ms=duration,
-                    error_message=str(e),
-                )
-                document.status = DocumentStatus.NEEDS_REVIEW
-                document.processed_at = datetime.now(timezone.utc)
-                await db.commit()
-                return
-
-            # ── Stage 5: Resolve (Agent — conditional) ────────────────────────
-            # The Resolver Agent fires when validation found fixable issues.
-            # It uses tools to re-examine problematic fields and returns corrected data.
-            # After resolution we re-run validation once (max one retry loop).
-            if _has_actionable_issues(validation):
-                t0 = time.monotonic()
-                await _log_stage(
-                    db, doc_uuid, PipelineStage.RESOLVE, StageStatus.STARTED,
-                    reasoning=(
-                        f"Resolver Agent triggered for {len(issues_dicts)} validation issue(s). "
-                        f"Using model: {settings.strong_model_name}."
-                    ),
-                )
-
-                try:
-                    resolver_result = await resolve_validation_issues(
-                        raw_text=parse_result.text,
-                        document_type=document.document_type,
-                        extracted_data=extracted_data,
-                        issues=issues_dicts,
-                    )
-                    duration = int((time.monotonic() - t0) * 1000)
-
-                    await _log_stage(
-                        db, doc_uuid, PipelineStage.RESOLVE,
-                        StageStatus.COMPLETED if resolver_result.resolved else StageStatus.FAILED,
-                        duration_ms=duration,
-                        metadata={
-                            "resolved": resolver_result.resolved,
-                            "corrections_applied": list(
-                                set(resolver_result.extracted_data.keys()) -
-                                set(extracted_data.keys()) |
-                                {k for k in resolver_result.extracted_data
-                                 if resolver_result.extracted_data[k] != extracted_data.get(k)}
-                            ),
-                            "tool_rounds": len(resolver_result.agent_steps),
-                        },
-                        reasoning=resolver_result.reasoning,
-                        agent_steps=resolver_result.agent_steps,
-                    )
-
-                    if resolver_result.resolved:
-                        # Apply corrections and re-run validation
-                        extracted_data = resolver_result.extracted_data
-                        document.extracted_data = extracted_data
-                        await _write_extracted_fields(db, doc_uuid, extracted_data)
-                        await db.commit()
-
-                        # ── Re-validate after resolution ──────────────────────
-                        t0 = time.monotonic()
-                        await _log_stage(
-                            db, doc_uuid, PipelineStage.VALIDATE, StageStatus.STARTED,
-                            reasoning="Re-validating after Resolver Agent applied corrections.",
-                        )
-                        validation = validate_and_score(
-                            extracted_data=extracted_data,
-                            document_type=document.document_type,
-                            extraction_method=extraction_method,
-                            parse_warnings=parse_result.warnings,
-                        )
-                        duration = int((time.monotonic() - t0) * 1000)
-                        re_issues = _issues_to_dicts(validation.issues)
-                        await _log_stage(
-                            db, doc_uuid, PipelineStage.VALIDATE, StageStatus.COMPLETED,
-                            duration_ms=duration,
-                            metadata={
-                                "confidence_score": validation.confidence_score,
-                                "field_completeness": validation.field_completeness,
-                                "cross_validation_score": validation.cross_validation_score,
-                                "issues": re_issues,
-                                "post_resolution": True,
-                            },
-                            reasoning=(
-                                f"Post-resolution validation: confidence={validation.confidence_score:.3f}, "
-                                f"{len(re_issues)} remaining issue(s)."
-                            ),
-                        )
-                        await db.commit()
-                    else:
-                        await db.commit()
-
-                except Exception as e:
-                    duration = int((time.monotonic() - t0) * 1000)
-                    await _log_stage(
-                        db, doc_uuid, PipelineStage.RESOLVE, StageStatus.FAILED,
-                        duration_ms=duration,
-                        error_message=str(e),
-                        reasoning=f"Resolver Agent raised an exception: {str(e)[:200]}",
-                    )
-                    await db.commit()
-                    # Continue with original validation score — don't fail the document
-
-            # ── Final routing decision (always runs, even after resolver errors) ──
-            try:
-                document.confidence_score = validation.confidence_score
-                document.processed_at = datetime.now(timezone.utc)
-
-                if validation.confidence_score >= settings.confidence_auto_approve:
-                    document.status = DocumentStatus.COMPLETED
-                elif validation.confidence_score >= settings.confidence_review_threshold:
-                    document.status = DocumentStatus.NEEDS_REVIEW
-                else:
-                    document.status = DocumentStatus.FAILED
-
-                await db.commit()
-            except Exception as routing_err:
-                # Safety net: document must never stay PROCESSING
-                await db.execute(
-                    update(Document)
-                    .where(Document.id == doc_uuid)
-                    .where(Document.status == DocumentStatus.PROCESSING)
-                    .values(
-                        status=DocumentStatus.NEEDS_REVIEW,
-                        processed_at=datetime.now(timezone.utc),
-                    )
-                )
-                await db.commit()
+            await db.commit()
 
             # ── Update full-text search vector (non-fatal) ────────────────────
             try:
@@ -461,12 +253,28 @@ async def process_document(document_id: str) -> None:
                 )
                 await db.commit()
             except Exception:
-                pass  # Non-fatal — search index may be stale but data is safe
+                pass  # Non-fatal
+
+            # ── Index to Elasticsearch (non-fatal) ────────────────────────────
+            try:
+                from app.elasticsearch import index_document
+                await index_document(
+                    document_id=str(doc_uuid),
+                    original_filename=document.original_filename,
+                    document_type=document.document_type,
+                    status=document.status.value,
+                    confidence_score=document.confidence_score,
+                    raw_text=document.raw_text,
+                    extracted_data=document.extracted_data,
+                    created_at=document.created_at,
+                )
+            except Exception:
+                pass  # Non-fatal — ES may not be running
 
         except Exception as e:
             import logging
-            logging.error(f"[DEBUG ORCHESTRATOR] Catch-all Exception: {e}", exc_info=True)
-            # Catch-all safety net: ensure document never stays PROCESSING forever.
+            logging.error(f"Pipeline error for {doc_uuid}: {e}", exc_info=True)
+            # Catch-all safety net
             try:
                 await db.execute(
                     update(Document)

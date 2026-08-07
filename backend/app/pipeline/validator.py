@@ -101,10 +101,6 @@ def validate_and_score(
     # 3. Extraction method score
     if extraction_method == "llm":
         method_score = 0.9
-    elif extraction_method.startswith("regex_fallback"):
-        method_score = 0.5
-    elif extraction_method == "regex":
-        method_score = 0.4
     else:
         method_score = 0.3
 

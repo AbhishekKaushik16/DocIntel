@@ -97,27 +97,34 @@ async def _tool_re_extract_section(
 
     elif provider == "gemini":
         try:
-            model = settings.strong_model_name
-            if not model.startswith("models/"):
-                model = f"models/{model}"
-            url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0},
-            }
-            async with httpx.AsyncClient(timeout=60) as client:
-                headers = {"Content-Type": "application/json", "x-goog-api-key": settings.gemini_api_key}
-                resp = None
-                for attempt in range(MAX_RETRIES):
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from langchain_core.messages import HumanMessage
+            
+            llm = ChatGoogleGenerativeAI(
+                model=settings.strong_model_name,
+                google_api_key=settings.gemini_api_key,
+                temperature=0,
+            )
+            
+            response = None
+            for attempt in range(MAX_RETRIES):
+                try:
                     await throttle_gemini_request()
-                    resp = await client.post(url, headers=headers, json=payload)
-                    if resp.status_code not in (429, 503):
-                        break
+                    response = await llm.ainvoke([HumanMessage(content=prompt)])
+                    break
+                except Exception as e:
+                    if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
+                        raise
                     await _sleep_backoff(attempt)
-                resp.raise_for_status()
-                raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                return json.loads(raw.strip())
-
+            raw_content = response.content
+            if isinstance(raw_content, list):
+                raw_content = raw_content[0].get("text", "") if raw_content else ""
+            raw = str(raw_content).strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            return json.loads(raw.strip())
         except Exception as e:
             return {"error": str(e)}
 
@@ -429,95 +436,75 @@ async def _run_gemini_resolver(
     extracted_data: dict[str, Any],
     issues: list[dict[str, Any]],
 ) -> ResolverResult:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+
     system_prompt = _build_system_prompt(document_type, issues, extracted_data)
-
-    model = settings.strong_model_name
-    if not model.startswith("models/"):
-        model = f"models/{model}"
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": settings.gemini_api_key}
-
-    contents = [
-        {
-            "role": "user",
-            "parts": [{"text": f"{system_prompt}\n\nPlease resolve the validation issues."}],
-        }
+    
+    llm = ChatGoogleGenerativeAI(
+        model=settings.strong_model_name,
+        google_api_key=settings.gemini_api_key,
+        temperature=0,
+    )
+    llm_with_tools = llm.bind_tools(RESOLVER_TOOL_SPECS)
+    
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content="Please resolve the validation issues described above.")
     ]
     agent_steps: list[dict] = []
 
-    async with httpx.AsyncClient(timeout=90) as client:
-        for round_num in range(MAX_RESOLVER_ROUNDS):
-            payload = {
-                "contents": contents,
-                "tools": [GEMINI_RESOLVER_SPECS],
-                "generationConfig": {"temperature": 0},
-            }
-            resp = None
-            for attempt in range(MAX_RETRIES):
+    for round_num in range(MAX_RESOLVER_ROUNDS):
+        response = None
+        for attempt in range(MAX_RETRIES):
+            try:
                 await throttle_gemini_request()
-                resp = await client.post(url, headers=headers, json=payload)
-                if resp.status_code not in (429, 503):
-                    break
+                response = await llm_with_tools.ainvoke(messages)
+                break
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
+                    raise
                 await _sleep_backoff(attempt)
-            resp.raise_for_status()
-            body = resp.json()
+        
+        if response.tool_calls:
+            messages.append(response)
+            for tool_call in response.tool_calls:
+                result = await _dispatch_resolver_tool(tool_call["name"], tool_call["args"], raw_text, document_type)
+                agent_steps.append({
+                    "round": round_num + 1,
+                    "tool": tool_call["name"],
+                    "input": tool_call["args"],
+                    "output": result,
+                })
+                messages.append(ToolMessage(
+                    tool_call_id=tool_call["id"],
+                    content=json.dumps(result)
+                ))
+        else:
+                raw_content = response.content
+                if isinstance(raw_content, list):
+                    raw_content = raw_content[0].get("text", "") if raw_content else ""
+                raw = str(raw_content).strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                answer = json.loads(raw.strip())
 
+                corrections: dict[str, Any] = answer.get("corrections", {})
+                resolved: bool = bool(answer.get("resolved", bool(corrections)))
+                reasoning: str = answer.get("reasoning", "")
 
-            candidate = body["candidates"][0]
-            parts = candidate["content"]["parts"]
+                updated = dict(extracted_data)
+                updated.update(corrections)
 
-            tool_calls_in_response = []
-            text_part = None
-            for part in parts:
-                if "functionCall" in part:
-                    tool_calls_in_response.append(part["functionCall"])
-                elif "text" in part:
-                    text_part = part["text"]
-
-            if tool_calls_in_response:
-                contents.append({"role": "model", "parts": parts})
-                tool_response_parts = []
-                for tc in tool_calls_in_response:
-                    result = await _dispatch_resolver_tool(tc["name"], tc.get("args", {}), raw_text, document_type)
-                    agent_steps.append({
-                        "round": round_num + 1,
-                        "tool": tc["name"],
-                        "input": tc.get("args", {}),
-                        "output": result,
-                    })
-                    tool_response_parts.append({
-                        "functionResponse": {
-                            "name": tc["name"],
-                            "response": {"result": result},
-                        }
-                    })
-                contents.append({"role": "user", "parts": tool_response_parts})
-
-            elif text_part:
-                try:
-                    raw = text_part.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("```")[1]
-                        if raw.startswith("json"):
-                            raw = raw[4:]
-                    answer = json.loads(raw.strip())
-
-                    corrections: dict[str, Any] = answer.get("corrections", {})
-                    resolved: bool = bool(answer.get("resolved", bool(corrections)))
-                    reasoning: str = answer.get("reasoning", "")
-
-                    updated = dict(extracted_data)
-                    updated.update(corrections)
-
-                    return ResolverResult(
-                        resolved=resolved,
-                        extracted_data=updated,
-                        reasoning=reasoning,
-                        agent_steps=agent_steps,
-                    )
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    break
-            else:
+                return ResolverResult(
+                    resolved=resolved,
+                    extracted_data=updated,
+                    reasoning=reasoning,
+                    agent_steps=agent_steps,
+                )
+            except (json.JSONDecodeError, KeyError, ValueError):
                 break
 
     return ResolverResult(

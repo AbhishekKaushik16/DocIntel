@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     gemini_strong_model: str = "gemini-2.5-pro"
     llm_enabled: bool = True  # If False or no API key, falls back to regex extraction
 
+    # --- Elasticsearch ---
+    elasticsearch_url: str = "http://localhost:9200"
+
     # --- CORS ---
     cors_origins: list[str] = ["http://localhost:3000"]
 
