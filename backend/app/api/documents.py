@@ -252,7 +252,15 @@ async def correct_fields(
             document.extracted_data = {}
         # SQLAlchemy won't detect in-place dict mutations on JSONB without this:
         merged = dict(document.extracted_data)
-        merged[correction.field_name] = correction.field_value
+        
+        import json
+        try:
+            val = json.loads(correction.field_value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            val = correction.field_value
+            
+        merged[correction.field_name] = val
+        
         document.extracted_data = merged
 
     # Auto-approve after human corrections

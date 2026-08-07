@@ -457,6 +457,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: '14px',
     outline: 'none',
     background: '#fff',
+    color: '#1e293b',
   },
   sendBtn: {
     width: '40px',

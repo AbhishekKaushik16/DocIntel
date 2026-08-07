@@ -81,36 +81,17 @@ async def _tool_re_extract_section(
 
     provider = settings.llm_provider.lower()
 
-    if provider == "openai":
-        try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.openai_api_key)
-            response = await client.chat.completions.create(
-                model=settings.strong_model_name,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0,
-            )
-            return json.loads(response.choices[0].message.content)
-        except Exception as e:
-            return {"error": str(e)}
+    try:
+            from app.utils.llm import get_llm
+            from langchain_core.messages import SystemMessage, HumanMessage
 
-    elif provider == "gemini":
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            from langchain_core.messages import HumanMessage
-            
-            llm = ChatGoogleGenerativeAI(
-                model=settings.strong_model_name,
-                google_api_key=settings.gemini_api_key,
-                temperature=0,
-            )
+            llm = get_llm(model_type="strong", temperature=0.0)
             
             response = None
             for attempt in range(MAX_RETRIES):
                 try:
                     await throttle_gemini_request()
-                    response = await llm.ainvoke([HumanMessage(content=prompt)])
+                    response = await llm.ainvoke([SystemMessage(content="You are a professional document resolving AI. Extract accurate JSON."), HumanMessage(content=prompt)])
                     break
                 except Exception as e:
                     if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
@@ -436,16 +417,12 @@ async def _run_gemini_resolver(
     extracted_data: dict[str, Any],
     issues: list[dict[str, Any]],
 ) -> ResolverResult:
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    from app.utils.llm import get_llm
     from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
     system_prompt = _build_system_prompt(document_type, issues, extracted_data)
     
-    llm = ChatGoogleGenerativeAI(
-        model=settings.strong_model_name,
-        google_api_key=settings.gemini_api_key,
-        temperature=0,
-    )
+    llm = get_llm(model_type="strong", temperature=0.0)
     llm_with_tools = llm.bind_tools(RESOLVER_TOOL_SPECS)
     
     messages = [

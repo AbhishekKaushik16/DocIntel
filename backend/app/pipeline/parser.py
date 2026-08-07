@@ -294,4 +294,10 @@ async def parse_document(file_path: str) -> ParseResult:
             warnings=[f"No parser available for file type: {ext}"],
         )
 
-    return await parser(file_path)
+    result = await parser(file_path)
+    
+    # Sanitize null bytes (\x00) which crash PostgreSQL text fields
+    if result.text:
+        result.text = result.text.replace("\x00", "")
+        
+    return result

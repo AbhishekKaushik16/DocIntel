@@ -276,7 +276,7 @@ QUERY_TOOL_SPECS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "The search query text."},
-                "document_type": {"type": "string", "description": "Optional filter by document type (e.g. 'financial_report', 'invoice')."},
+                "document_type": {"type": "string", "description": "Optional exact match filter by document type. WARNING: Types are dynamically generated (e.g., 'earnings_release', 'w2_tax_form'). Do NOT use this filter for broad categories like 'financial_report'. Leave it empty and put keywords in the 'query' instead unless you know the exact snake_case type."},
                 "max_results": {"type": "integer", "description": "Max results to return (default 5).", "default": 5},
             },
             "required": ["query"],
@@ -373,7 +373,7 @@ QUERY_SYSTEM_PROMPT = (
     "You have tools to search documents, query specific fields, and run aggregations.\n\n"
     "Strategy:\n"
     "1. Understand what the user is asking for.\n"
-    "2. Use search_documents for general keyword/topic queries.\n"
+    "2. Use search_documents for general keyword/topic queries. Do NOT filter by document_type unless you know the exact dynamic snake_case type. Use keywords in your query instead.\n"
     "3. Use query_jsonb for specific field value lookups.\n"
     "4. Use aggregate_stats for counting/averaging across documents.\n"
     "5. Use get_document_detail to dive deep into a specific document.\n"
@@ -392,9 +392,7 @@ MAX_QUERY_ROUNDS = 6
 async def run_query_agent(question: str) -> QueryResult:
     """
     Run the query agent to answer a natural language question.
-
-    Uses Gemini with function calling to iteratively query the database
-    and synthesize an answer.
+    Uses LangChain to iteratively query the database and synthesize an answer.
     """
     if not settings.llm_available:
         return QueryResult(
@@ -403,104 +401,68 @@ async def run_query_agent(question: str) -> QueryResult:
             agent_reasoning="No LLM configured.",
         )
 
-    model = settings.fast_model_name
-    if not model.startswith("models/"):
-        model = f"models/{model}"
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": settings.gemini_api_key}
-
-    contents = [
-        {
-            "role": "user",
-            "parts": [{"text": f"{QUERY_SYSTEM_PROMPT}\n\nUser question: {question}"}],
-        }
+    from app.utils.llm import get_llm
+    from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+    
+    llm = get_llm(model_type="fast", temperature=0.0)
+    llm_with_tools = llm.bind_tools(QUERY_TOOL_SPECS)
+    
+    messages = [
+        SystemMessage(content=QUERY_SYSTEM_PROMPT),
+        HumanMessage(content=f"User question: {question}")
     ]
     agent_steps: list[dict] = []
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        for round_num in range(MAX_QUERY_ROUNDS):
-            payload = {
-                "contents": contents,
-                "tools": [GEMINI_QUERY_TOOLS],
-                "generationConfig": {"temperature": 0},
-            }
-
+    
+    for round_num in range(MAX_QUERY_ROUNDS):
+        if settings.llm_provider.lower() == "gemini":
+            from app.utils.rate_limit import throttle_gemini_request
             await throttle_gemini_request()
-            resp = await client.post(url, headers=headers, json=payload)
-
-            if resp.status_code in (429, 503):
-                # Rate limited — return partial answer
+            
+        resp = await llm_with_tools.ainvoke(messages)
+        messages.append(resp)
+        
+        if not resp.tool_calls:
+            # Done
+            try:
+                raw_content = resp.content
+                if isinstance(raw_content, list):
+                    raw_content = raw_content[0].get("text", "") if raw_content else ""
+                raw = str(raw_content).strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                data = json.loads(raw.strip())
                 return QueryResult(
-                    answer="I'm currently rate-limited. Please try again in a moment.",
-                    sources=[],
-                    agent_reasoning=f"Rate limited after {round_num} rounds.",
+                    answer=data.get("answer", str(raw_content)),
+                    sources=data.get("sources", []),
+                    agent_reasoning=data.get("reasoning", ""),
                     query_steps=agent_steps,
                 )
-
-            resp.raise_for_status()
-            body = resp.json()
-
-            candidate = body["candidates"][0]
-            parts = candidate["content"]["parts"]
-
-            # Collect tool calls and text
-            tool_calls = []
-            text_part = None
-            for part in parts:
-                if "functionCall" in part:
-                    tool_calls.append(part["functionCall"])
-                elif "text" in part:
-                    text_part = part["text"]
-
-            if tool_calls:
-                # Execute tools
-                contents.append({"role": "model", "parts": parts})
-                tool_response_parts = []
-
-                for tc in tool_calls:
-                    result = await _dispatch_query_tool(tc["name"], tc.get("args", {}))
-                    agent_steps.append({
-                        "round": round_num + 1,
-                        "tool": tc["name"],
-                        "input": tc.get("args", {}),
-                        "output": result,
-                    })
-                    tool_response_parts.append({
-                        "functionResponse": {
-                            "name": tc["name"],
-                            "response": {"result": result},
-                        }
-                    })
-                contents.append({"role": "user", "parts": tool_response_parts})
-
-            elif text_part:
-                # Agent is done — parse the answer
-                try:
-                    raw = text_part.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("```")[1]
-                        if raw.startswith("json"):
-                            raw = raw[4:]
-                    if raw.endswith("```"):
-                        raw = raw[:-3]
-                    data = json.loads(raw.strip())
-                    return QueryResult(
-                        answer=data.get("answer", text_part),
-                        sources=data.get("sources", []),
-                        agent_reasoning=data.get("reasoning", ""),
-                        query_steps=agent_steps,
-                    )
-                except (json.JSONDecodeError, KeyError):
-                    # Model returned free-text — use it directly
-                    return QueryResult(
-                        answer=text_part,
-                        sources=[],
-                        agent_reasoning="Agent returned free-text answer.",
-                        query_steps=agent_steps,
-                    )
-            else:
-                break
-
+            except (json.JSONDecodeError, KeyError):
+                return QueryResult(
+                    answer=str(resp.content),
+                    sources=[],
+                    agent_reasoning="Agent returned free-text answer.",
+                    query_steps=agent_steps,
+                )
+                
+        # Execute tools
+        for tc in resp.tool_calls:
+            result = await _dispatch_query_tool(tc["name"], tc.get("args", {}))
+            agent_steps.append({
+                "round": round_num + 1,
+                "tool": tc["name"],
+                "input": tc.get("args", {}),
+                "output": result,
+            })
+            messages.append(ToolMessage(
+                tool_call_id=tc["id"],
+                content=json.dumps(result)
+            ))
+            
     return QueryResult(
         answer="I couldn't find a definitive answer. Please try rephrasing your question.",
         sources=[],

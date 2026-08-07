@@ -71,6 +71,9 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
       GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3.5-flash}
+      OPEN_ROUTER_API_KEY: ${OPEN_ROUTER_API_KEY:-}
+      OPEN_ROUTER_MODEL: ${OPEN_ROUTER_MODEL:-openai/gpt-4o-mini}
+      OPEN_ROUTER_STRONG_MODEL: ${OPEN_ROUTER_STRONG_MODEL:-openai/gpt-4o}
       ELASTICSEARCH_URL: http://elasticsearch:9200
       DEBUG: "true"
     depends_on:
@@ -100,6 +103,9 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
       GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3.5-flash}
+      OPEN_ROUTER_API_KEY: ${OPEN_ROUTER_API_KEY:-}
+      OPEN_ROUTER_MODEL: ${OPEN_ROUTER_MODEL:-openai/gpt-4o-mini}
+      OPEN_ROUTER_STRONG_MODEL: ${OPEN_ROUTER_STRONG_MODEL:-openai/gpt-4o}
       ELASTICSEARCH_URL: http://elasticsearch:9200
     depends_on:
       postgres:

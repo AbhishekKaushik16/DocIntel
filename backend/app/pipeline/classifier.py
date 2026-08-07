@@ -309,9 +309,9 @@ SYSTEM_PROMPT = (
     "5. Once you are confident, return a final JSON object (no markdown):\n"
     "   {\"document_type\": \"<lowercase_snake_case>\", \"confidence\": <0.0-1.0>, "
     "   \"reasoning\": \"<one or two sentences explaining your decision>\"}\n\n"
-    "Document types include: invoice, receipt, contract, resume, bank_statement, "
-    "tax_return, medical_report, purchase_order, utility_bill, study_guide, "
-    "interview_guide, or any other descriptive snake_case type.\n\n"
+    "IMPORTANT: There is NO hardcoded list of document types. You must dynamically classify the document based on its actual content. "
+    "Be specific! For example, use 'w2_tax_form' instead of 'tax_return', or 'earnings_release' instead of 'document', or 'network_architecture_diagram'. "
+    "Do NOT use generic types like 'document', 'spreadsheet', or 'file' unless it is absolutely impossible to determine the specific nature of the content.\n\n"
     "Do not guess without using at least one tool."
 )
 
@@ -372,17 +372,17 @@ async def _run_openai_agent(file_path: str) -> ClassificationResult:
                     agent_steps=agent_steps,
                 )
             except (json.JSONDecodeError, KeyError, ValueError):
-                # Model returned free-text instead of JSON — extract type from text
-                text_lower = msg.content.lower()
-                for doc_type in ["invoice", "receipt", "contract", "resume", "bank_statement"]:
-                    if doc_type in text_lower:
-                        return ClassificationResult(
-                            document_type=doc_type,
-                            confidence=0.7,
-                            method="agent_text_parse",
-                            reasoning=msg.content[:300],
-                            agent_steps=agent_steps,
-                        )
+                import re
+                match = re.search(r'"document_type"\s*:\s*"([^"]+)"', raw)
+                if match:
+                    doc_type = match.group(1).lower().replace(" ", "_")
+                    return ClassificationResult(
+                        document_type=doc_type,
+                        confidence=0.5,
+                        method="agent_regex_parse",
+                        reasoning=msg.content[:300],
+                        agent_steps=agent_steps,
+                    )
                 break
 
     return ClassificationResult(
@@ -396,14 +396,10 @@ async def _run_openai_agent(file_path: str) -> ClassificationResult:
 
 async def _run_gemini_agent(file_path: str) -> ClassificationResult:
     """Run the Classifier Agent using LangChain with Gemini."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+    from app.utils.llm import get_llm
     
-    llm = ChatGoogleGenerativeAI(
-        model=settings.fast_model_name,
-        google_api_key=settings.gemini_api_key,
-        temperature=0,
-    )
+    llm = get_llm(model_type="fast", temperature=0.0)
     llm_with_tools = llm.bind_tools(TOOL_SPECS)
     
     messages = [
@@ -416,6 +412,7 @@ async def _run_gemini_agent(file_path: str) -> ClassificationResult:
         response = None
         for attempt in range(MAX_RETRIES):
             try:
+                from app.utils.rate_limit import throttle_gemini_request
                 await throttle_gemini_request()
                 response = await llm_with_tools.ainvoke(messages)
                 break
@@ -458,16 +455,17 @@ async def _run_gemini_agent(file_path: str) -> ClassificationResult:
                     agent_steps=agent_steps,
                 )
             except (json.JSONDecodeError, KeyError, ValueError):
-                text_lower = str(raw_content).lower()
-                for doc_type in ["invoice", "receipt", "contract", "resume", "bank_statement"]:
-                    if doc_type in text_lower:
-                        return ClassificationResult(
-                            document_type=doc_type,
-                            confidence=0.7,
-                            method="agent_text_parse",
-                            reasoning=str(raw_content)[:300],
-                            agent_steps=agent_steps,
-                        )
+                import re
+                match = re.search(r'"document_type"\s*:\s*"([^"]+)"', raw)
+                if match:
+                    doc_type = match.group(1).lower().replace(" ", "_")
+                    return ClassificationResult(
+                        document_type=doc_type,
+                        confidence=0.5,
+                        method="agent_regex_parse",
+                        reasoning=str(raw_content)[:300],
+                        agent_steps=agent_steps,
+                    )
                 break
 
     return ClassificationResult(
@@ -557,20 +555,8 @@ async def classify_document(file_path: str) -> ClassificationResult:
     Returns:
         ClassificationResult with document_type, confidence, reasoning, agent_steps.
     """
-    # ── Step 1: Local heuristic pre-flight (free, instant) ────────────────────
+    # ── Step 1: Local heuristic fallback generation ────────────────────
     heuristic = _heuristic_fallback(file_path)
-    if heuristic.confidence >= 0.75:
-        # Confident heuristic match — no LLM call needed
-        return ClassificationResult(
-            document_type=heuristic.document_type,
-            confidence=heuristic.confidence,
-            method="heuristic_confident",
-            reasoning=(
-                f"High-confidence heuristic match: '{heuristic.document_type}' "
-                f"(confidence={heuristic.confidence:.2f}). LLM skipped."
-            ),
-            agent_steps=[],
-        )
 
     # ── Step 2: LLM agent for uncertain / novel document types ────────────────
     if not settings.llm_available:
@@ -580,7 +566,7 @@ async def classify_document(file_path: str) -> ClassificationResult:
         provider = settings.llm_provider.lower()
         if provider == "openai":
             result = await _run_openai_agent(file_path)
-        elif provider == "gemini":
+        elif provider in ("gemini", "openrouter"):
             result = await _run_gemini_agent(file_path)
         else:
             result = heuristic

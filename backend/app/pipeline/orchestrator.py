@@ -131,7 +131,7 @@ async def _persist_pipeline_logs(
         )
 
     # Extract log
-    if "extracted_data" in state:
+    if "extracted_data" in state or state.get("error", "").startswith("Extraction"):
         await _log_stage(
             db, doc_uuid, PipelineStage.EXTRACT,
             StageStatus.FAILED if state.get("error", "").startswith("Extraction") else StageStatus.COMPLETED,
@@ -214,7 +214,9 @@ async def process_document(document_id: str) -> None:
             if final_state.get("extracted_data"):
                 document.extracted_data = final_state["extracted_data"]
                 await _write_extracted_fields(db, doc_uuid, final_state["extracted_data"])
-            if final_state.get("confidence_score") is not None:
+            if final_state.get("error"):
+                document.confidence_score = None
+            elif final_state.get("confidence_score") is not None:
                 document.confidence_score = final_state["confidence_score"]
 
             # Set final status
@@ -282,6 +284,7 @@ async def process_document(document_id: str) -> None:
                     .where(Document.status == DocumentStatus.PROCESSING)
                     .values(
                         status=DocumentStatus.FAILED,
+                        confidence_score=None,
                         processed_at=datetime.now(timezone.utc),
                     )
                 )

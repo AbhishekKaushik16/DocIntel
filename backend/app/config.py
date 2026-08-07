@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash"
     # Strong model for resolution (Gemini 2.5 Pro or similar)
     gemini_strong_model: str = "gemini-2.5-pro"
+    
+    open_router_api_key: str = ""
+    open_router_model: str = "openai/gpt-4o-mini"
+    open_router_strong_model: str = "openai/gpt-4o"
     llm_enabled: bool = True  # If False or no API key, falls back to regex extraction
 
     # --- Elasticsearch ---
@@ -61,6 +65,8 @@ class Settings(BaseSettings):
             return bool(self.openai_api_key)
         if provider == "gemini":
             return bool(self.gemini_api_key)
+        if provider == "openrouter":
+            return bool(self.open_router_api_key)
         return False
 
     @property
@@ -71,6 +77,8 @@ class Settings(BaseSettings):
             return self.openai_model
         if provider == "gemini":
             return self.gemini_model
+        if provider == "openrouter":
+            return self.open_router_model
         return self.openai_model
 
     @property
@@ -81,6 +89,8 @@ class Settings(BaseSettings):
             return self.openai_strong_model
         if provider == "gemini":
             return self.gemini_strong_model
+        if provider == "openrouter":
+            return self.open_router_strong_model
         return self.openai_strong_model
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

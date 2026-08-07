@@ -31,12 +31,44 @@ async def extract_with_llm(
     Discovers fields dynamically from the document without forcing a hardcoded schema.
     """
     provider = settings.llm_provider.lower()
-    if provider == "openai":
-        return await extract_with_openai(text, document_type)
-    if provider == "gemini":
-        return await extract_with_gemini(text, document_type)
+    from app.utils.llm import get_llm
+    from langchain_core.messages import SystemMessage, HumanMessage
+
+    prompt = _build_extraction_prompt(text, document_type)
     
-    raise ValueError(f"Unsupported LLM provider: {settings.llm_provider}")
+    # We will use the fast model for extraction to save time, or strong model if configured
+    llm = get_llm(model_type="fast", temperature=0.0)
+
+    messages = [
+        SystemMessage(content="You are a professional document extractor. Output a comprehensive and valid JSON object."),
+        HumanMessage(content=prompt)
+    ]
+    
+    response = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            if provider == "gemini":
+                from app.utils.rate_limit import throttle_gemini_request
+                await throttle_gemini_request()
+            response = await llm.ainvoke(messages)
+            break
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
+                raise
+            await _sleep_backoff(attempt)
+
+    raw_content = response.content
+    if isinstance(raw_content, list):
+        raw_content = raw_content[0].get("text", "") if raw_content else ""
+    raw_json = str(raw_content).strip()
+    if raw_json.startswith("```json"):
+        raw_json = raw_json[7:]
+    elif raw_json.startswith("```"):
+        raw_json = raw_json[3:]
+    if raw_json.endswith("```"):
+        raw_json = raw_json[:-3]
+
+    return json.loads(raw_json.strip())
 
 
 def _build_extraction_prompt(text: str, document_type: str) -> str:
@@ -53,81 +85,6 @@ def _build_extraction_prompt(text: str, document_type: str) -> str:
         f"Return ONLY a single valid JSON object. Do not include markdown code block syntax unless necessary.\n"
         f"Document text:\n{truncated_text}"
     )
-
-
-async def extract_with_openai(
-    text: str,
-    document_type: str,
-) -> dict[str, Any]:
-    from openai import AsyncOpenAI
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
-    prompt = _build_extraction_prompt(text, document_type)
-
-    response = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = await client.chat.completions.create(
-                model=settings.fast_model_name,
-                messages=[
-                    {"role": "system", "content": "You are a professional document extractor. Output valid JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0,
-            )
-            break
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
-                raise
-            await _sleep_backoff(attempt)
-
-    raw_json = response.choices[0].message.content
-    return json.loads(raw_json)
-
-
-async def extract_with_gemini(
-    text: str,
-    document_type: str,
-) -> dict[str, Any]:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    from langchain_core.messages import SystemMessage, HumanMessage
-
-    prompt = _build_extraction_prompt(text, document_type)
-
-    llm = ChatGoogleGenerativeAI(
-        model=settings.fast_model_name,
-        google_api_key=settings.gemini_api_key,
-        temperature=0,
-        max_retries=6,
-    )
-    
-    messages = [
-        SystemMessage(content="You are a professional document extractor. Output a comprehensive and valid JSON object."),
-        HumanMessage(content=prompt)
-    ]
-    
-    response = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            await throttle_gemini_request()
-            response = await llm.ainvoke(messages)
-            break
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
-                raise
-            await _sleep_backoff(attempt)
-    raw_content = response.content
-    if isinstance(raw_content, list):
-        raw_content = raw_content[0].get("text", "") if raw_content else ""
-    raw_json = str(raw_content).strip()
-    if raw_json.startswith("```json"):
-        raw_json = raw_json[7:]
-    elif raw_json.startswith("```"):
-        raw_json = raw_json[3:]
-    if raw_json.endswith("```"):
-        raw_json = raw_json[:-3]
-
-    return json.loads(raw_json.strip())
 
 
 async def extract_structured_data(

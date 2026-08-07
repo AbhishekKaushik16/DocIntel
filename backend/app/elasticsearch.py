@@ -159,7 +159,7 @@ async def search_documents(
                         "extracted_data.*^2",
                     ],
                     "type": "best_fields",
-                    "fuzziness": "AUTO",
+                    "lenient": True,
                 }
             })
 
@@ -242,7 +242,7 @@ async def search_extracted_data(
                 "multi_match": {
                     "query": query,
                     "fields": [search_field],
-                    "fuzziness": "AUTO",
+                    "lenient": True,
                 }
             },
             "size": size,

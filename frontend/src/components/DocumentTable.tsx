@@ -25,11 +25,15 @@ export default function DocumentTable({ documents, onRefresh, onDelete }: Docume
   return (
     <div className="bg-[#111827] border border-gray-800 rounded-xl overflow-hidden shadow-xl">
       <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm text-gray-300">
+        <table className="w-full table-fixed text-left text-sm text-gray-300">
           <thead className="bg-[#192237] text-xs uppercase font-semibold text-gray-400 border-b border-gray-800">
             <tr>
-              <th className="px-6 py-4">Document</th>
-              <th className="px-6 py-4">Type</th>
+              <th className="p-0 border-r border-[#1e293b]">
+                <div className="resize-x overflow-hidden px-6 py-4 min-w-[200px] w-[300px]">Document</div>
+              </th>
+              <th className="p-0 border-r border-[#1e293b]">
+                <div className="resize-x overflow-hidden px-6 py-4 min-w-[120px] w-[200px]">Type</div>
+              </th>
               <th className="px-6 py-4">Status</th>
               <th className="px-6 py-4">Confidence</th>
               <th className="px-6 py-4">Uploaded</th>
@@ -42,12 +46,15 @@ export default function DocumentTable({ documents, onRefresh, onDelete }: Docume
                 <td className="px-6 py-4 font-medium text-gray-200">
                   <div className="flex items-center space-x-3">
                     <FileText className="w-4 h-4 text-blue-400 flex-shrink-0" />
-                    <span className="truncate max-w-xs">{doc.original_filename}</span>
+                    <span className="truncate w-full block">{doc.original_filename}</span>
                   </div>
                 </td>
                 <td className="px-6 py-4">
-                  <span className="capitalize px-2.5 py-0.5 rounded text-xs bg-gray-800 text-gray-300 border border-gray-700 font-mono">
-                    {doc.document_type || 'Unclassified'}
+                  <span 
+                    className="capitalize px-2.5 py-1 rounded text-[11px] bg-gray-800 text-gray-300 border border-gray-700 font-mono inline-block w-full max-w-full truncate align-middle"
+                    title={doc.document_type || 'Unclassified'}
+                  >
+                    {doc.document_type ? doc.document_type.replace(/_/g, ' ') : 'Unclassified'}
                   </span>
                 </td>
                 <td className="px-6 py-4">
@@ -70,25 +77,28 @@ export default function DocumentTable({ documents, onRefresh, onDelete }: Docume
                     <span className="text-gray-500">—</span>
                   )}
                 </td>
-                <td className="px-6 py-4 text-gray-400 text-xs">
+                <td className="px-6 py-4 text-gray-400 text-xs whitespace-nowrap">
                   {new Date(doc.created_at).toLocaleString()}
                 </td>
-                <td className="px-6 py-4 text-right space-x-2">
-                  <Link
-                    href={`/documents/${doc.id}`}
-                    className="inline-flex items-center space-x-1 text-xs text-blue-400 hover:text-blue-300 font-medium px-2.5 py-1 rounded bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 transition-all"
-                  >
-                    <Eye className="w-3.5 h-3.5" />
-                    <span>View / Review</span>
-                  </Link>
-                  {onDelete && (
-                    <button
-                      onClick={() => onDelete(doc.id)}
-                      className="inline-flex items-center text-xs text-gray-500 hover:text-rose-400 p-1 rounded hover:bg-rose-500/10 transition-all"
+                <td className="px-6 py-4">
+                  <div className="flex items-center justify-end space-x-2">
+                    <Link
+                      href={`/documents/${doc.id}`}
+                      className="inline-flex items-center space-x-1.5 text-xs text-blue-400 hover:text-blue-300 font-medium px-3 py-1.5 rounded bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 transition-all whitespace-nowrap"
                     >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  )}
+                      <Eye className="w-3.5 h-3.5" />
+                      <span>View / Review</span>
+                    </Link>
+                    {onDelete && (
+                      <button
+                        onClick={() => onDelete(doc.id)}
+                        className="inline-flex items-center justify-center p-1.5 rounded text-gray-500 hover:text-rose-400 hover:bg-rose-500/10 transition-all"
+                        title="Delete Document"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
