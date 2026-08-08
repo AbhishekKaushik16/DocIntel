@@ -71,9 +71,9 @@ async def upload_documents(
             )
             continue
 
-        # Validate file size
-        content = await file.read()
-        if len(content) > settings.max_file_size_mb * 1024 * 1024:
+        # Fast fail if the browser/client provided the content-length (FastAPI exposes this as file.size)
+        max_bytes = settings.max_file_size_mb * 1024 * 1024
+        if file.size and file.size > max_bytes:
             responses.append(
                 UploadResponse(
                     id=uuid.uuid4(),
@@ -85,13 +85,32 @@ async def upload_documents(
             continue
 
         # RC-6: Write file to disk and create DB record atomically.
-        # If the DB commit fails we delete the orphaned file so disk stays clean.
+        # Stream chunk by chunk to disk to optimize RAM (preventing OOM on huge files).
         doc_id = uuid.uuid4()
         safe_filename = f"{doc_id}{ext}"
         file_path = upload_dir / safe_filename
 
+        actual_size = 0
+        exceeded_limit = False
         async with aiofiles.open(file_path, "wb") as f:
-            await f.write(content)
+            while chunk := await file.read(1024 * 1024):  # read in 1MB chunks
+                actual_size += len(chunk)
+                if actual_size > max_bytes:
+                    exceeded_limit = True
+                    break
+                await f.write(chunk)
+                
+        if exceeded_limit:
+            file_path.unlink(missing_ok=True)
+            responses.append(
+                UploadResponse(
+                    id=doc_id,
+                    original_filename=file.filename or "unknown",
+                    status=DocumentStatus.FAILED,
+                    message=f"File exceeds maximum size of {settings.max_file_size_mb}MB",
+                )
+            )
+            continue
 
         try:
             document = Document(
@@ -99,7 +118,7 @@ async def upload_documents(
                 original_filename=file.filename or "unknown",
                 file_path=str(file_path),
                 mime_type=file.content_type,
-                file_size_bytes=len(content),
+                file_size_bytes=actual_size,
                 status=DocumentStatus.PENDING,
             )
             db.add(document)

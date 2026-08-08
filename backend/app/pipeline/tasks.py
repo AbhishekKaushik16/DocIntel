@@ -37,8 +37,8 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,           # Don't ack until task completes (prevents lost tasks)
     worker_prefetch_multiplier=1,  # Process one task at a time per worker
-    task_soft_time_limit=300,      # 5-minute soft limit  → SoftTimeLimitExceeded raised
-    task_time_limit=360,           # 6-minute hard limit  → SIGKILL
+    task_soft_time_limit=1800,     # 30-minute soft limit
+    task_time_limit=1860,          # 31-minute hard limit
     # Exponential backoff for retries: 30s, then 60s
     task_default_retry_delay=30,
 )

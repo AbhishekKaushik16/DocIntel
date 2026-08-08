@@ -22,6 +22,7 @@ DOCUMENT_INDEX = "docintel_documents"
 # Index settings with dynamic mapping for flexible schemas
 INDEX_SETTINGS = {
     "settings": {
+        "index.mapping.total_fields.limit": 10000,
         "number_of_shards": 1,
         "number_of_replicas": 0,
         "analysis": {

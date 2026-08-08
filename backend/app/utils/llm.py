@@ -13,6 +13,7 @@ def get_llm(model_type: str = "fast", temperature: float = 0.0) -> BaseChatModel
             model=model_name,
             temperature=temperature,
             max_retries=6,
+            timeout=60,
         )
     elif provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -22,6 +23,7 @@ def get_llm(model_type: str = "fast", temperature: float = 0.0) -> BaseChatModel
             google_api_key=settings.gemini_api_key,
             temperature=temperature,
             max_retries=6,
+            timeout=60,
         )
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
@@ -31,6 +33,7 @@ def get_llm(model_type: str = "fast", temperature: float = 0.0) -> BaseChatModel
             model=model_name,
             temperature=temperature,
             max_retries=6,
+            timeout=60,
         )
     
     raise ValueError(f"Unsupported LLM provider: {provider}")
