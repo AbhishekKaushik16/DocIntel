@@ -66,10 +66,21 @@ export default function QueryChat() {
     setLoading(true);
 
     try {
+      const chatHistory = messages
+        .filter(m => !m.loading && m.content)
+        .map(m => ({
+          role: m.role,
+          content: m.content
+        }));
+
       const res = await fetch(`${API_BASE}/api/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, max_results: 10 }),
+        body: JSON.stringify({ 
+          question, 
+          max_results: 10,
+          chat_history: chatHistory
+        }),
       });
 
       if (!res.ok) throw new Error('Query failed');

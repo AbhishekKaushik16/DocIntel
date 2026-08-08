@@ -10,6 +10,7 @@ class QueryRequest(BaseModel):
     """Natural language query request."""
     question: str = Field(..., min_length=1, description="Natural language question")
     max_results: int = Field(10, ge=1, le=50, description="Maximum results to return")
+    chat_history: list[dict[str, str]] = Field(default_factory=list, description="Previous conversation history")
 
 
 class QuerySource(BaseModel):
@@ -52,7 +53,7 @@ async def query_documents(request: QueryRequest):
     """
     from app.pipeline.query_agent import run_query_agent
 
-    result = await run_query_agent(request.question)
+    result = await run_query_agent(request.question, request.chat_history)
 
     return QueryResponse(
         answer=result.answer,

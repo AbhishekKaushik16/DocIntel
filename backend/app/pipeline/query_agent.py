@@ -389,7 +389,7 @@ QUERY_SYSTEM_PROMPT = (
 MAX_QUERY_ROUNDS = 6
 
 
-async def run_query_agent(question: str) -> QueryResult:
+async def run_query_agent(question: str, chat_history: list[dict[str, str]] | None = None) -> QueryResult:
     """
     Run the query agent to answer a natural language question.
     Uses LangChain to iteratively query the database and synthesize an answer.
@@ -402,15 +402,23 @@ async def run_query_agent(question: str) -> QueryResult:
         )
 
     from app.utils.llm import get_llm
-    from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+    from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
     
     llm = get_llm(model_type="fast", temperature=0.0)
     llm_with_tools = llm.bind_tools(QUERY_TOOL_SPECS)
     
     messages = [
-        SystemMessage(content=QUERY_SYSTEM_PROMPT),
-        HumanMessage(content=f"User question: {question}")
+        SystemMessage(content=QUERY_SYSTEM_PROMPT)
     ]
+    
+    if chat_history:
+        for msg in chat_history:
+            if msg.get("role") == "user":
+                messages.append(HumanMessage(content=msg.get("content", "")))
+            elif msg.get("role") == "assistant":
+                messages.append(AIMessage(content=msg.get("content", "")))
+                
+    messages.append(HumanMessage(content=f"User question: {question}"))
     agent_steps: list[dict] = []
     
     for round_num in range(MAX_QUERY_ROUNDS):
