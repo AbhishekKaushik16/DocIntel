@@ -46,3 +46,12 @@ This is a running log of the real calls we made while building DocIntel, focusin
 *   **The alternatives:** Hard-failing documents into a "Needs Review" queue the second a validation rule (e.g., "Subtotal + Tax != Total") fails.
 *   **The reasoning:** LLMs often make trivial math mistakes or hallucinate a digit. Forcing a human to review every minor hallucination defeats the purpose of automation. The Resolver Agent receives the exact validation errors and the raw text, uses a ReAct loop to diagnose the failure, and autonomously patches the JSON payload. It has a strict retry limit to prevent infinite loops.
 *   **What you deliberately cut:** We still kept the Human-in-the-Loop (HITL) UI for low-confidence scores (`< 0.8`), but we cut out human intervention for deterministic validation failures that the agent can mathematically prove and fix itself.
+
+---
+
+## 6. UX Depth: Real-Time SSE Streaming for Query Agent
+
+*   **The decision:** We overhauled the backend query API and the React frontend to use Server-Sent Events (SSE) combined with a custom `ReadableStream` parser to stream the AI's response dynamically.
+*   **The alternatives:** A standard synchronous HTTP request that forces the user to wait 10-15 seconds while the agent fetches tools and generates a complete response.
+*   **The reasoning:** We wanted to prioritize a delightful end-to-end user journey. When an LLM executes tools (like querying a database), the latency is massive. By implementing streaming, we provide immediate visual feedback (the tool logs stream in instantly), and the user sees the answer being typed out word-by-word. We even implemented a resilient fallback in the frontend parser to ensure the UI doesn't break if the AI fails to perfectly format its XML response.
+*   **What you deliberately cut:** We chose to use plain React `ReadableStream` logic rather than adopting heavy real-time websocket frameworks like Socket.io or GraphQL subscriptions, minimizing our backend dependency footprint while still delivering a highly interactive experience.
