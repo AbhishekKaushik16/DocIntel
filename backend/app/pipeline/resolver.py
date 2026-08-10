@@ -82,32 +82,32 @@ async def _tool_re_extract_section(
     provider = settings.llm_provider.lower()
 
     try:
-            from app.utils.llm import get_llm
-            from langchain_core.messages import SystemMessage, HumanMessage
+        from app.utils.llm import get_llm
+        from langchain_core.messages import SystemMessage, HumanMessage
 
-            llm = get_llm(model_type="strong", temperature=0.0)
-            
-            response = None
-            for attempt in range(MAX_RETRIES):
-                try:
-                    await throttle_gemini_request()
-                    response = await llm.ainvoke([SystemMessage(content="You are a professional document resolving AI. Extract accurate JSON."), HumanMessage(content=prompt)])
-                    break
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
-                        raise
-                    await _sleep_backoff(attempt)
-            raw_content = response.content
-            if isinstance(raw_content, list):
-                raw_content = raw_content[0].get("text", "") if raw_content else ""
-            raw = str(raw_content).strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            return json.loads(raw.strip())
-        except Exception as e:
-            return {"error": str(e)}
+        llm = get_llm(model_type="strong", temperature=0.0)
+        
+        response = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                await throttle_gemini_request()
+                response = await llm.ainvoke([SystemMessage(content="You are a professional document resolving AI. Extract accurate JSON."), HumanMessage(content=prompt)])
+                break
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1 or ("429" not in str(e) and "503" not in str(e)):
+                    raise
+                await _sleep_backoff(attempt)
+        raw_content = response.content
+        if isinstance(raw_content, list):
+            raw_content = raw_content[0].get("text", "") if raw_content else ""
+        raw = str(raw_content).strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as e:
+        return {"error": str(e)}
 
     return {"error": "No LLM provider configured"}
 
@@ -458,6 +458,7 @@ async def _run_gemini_resolver(
                     content=json.dumps(result)
                 ))
         else:
+            try:
                 raw_content = response.content
                 if isinstance(raw_content, list):
                     raw_content = raw_content[0].get("text", "") if raw_content else ""
