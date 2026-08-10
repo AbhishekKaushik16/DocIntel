@@ -1,6 +1,7 @@
 """Query API — Natural language query interface for document intelligence."""
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/query", tags=["query"])
@@ -36,43 +37,14 @@ class QueryResponse(BaseModel):
     query_steps: list[QueryStep]
 
 
-@router.post("", response_model=QueryResponse)
+@router.post("")
 async def query_documents(request: QueryRequest):
     """
     Ask a natural language question about your documents.
-
-    The query agent will use tools to search, filter, and aggregate
-    data from your document collection, then synthesize a natural
-    language answer with citations.
-
-    Examples:
-    - "What was Amazon's Q2 2026 revenue?"
-    - "Show me all invoices over $10,000"
-    - "How many documents have I uploaded?"
-    - "What are the key findings in the financial report?"
     """
-    from app.pipeline.query_agent import run_query_agent
+    from app.pipeline.query_agent import stream_query_agent
 
-    result = await run_query_agent(request.question, request.chat_history)
-
-    return QueryResponse(
-        answer=result.answer,
-        sources=[
-            QuerySource(
-                document_id=s.get("document_id"),
-                filename=s.get("filename"),
-                relevance=s.get("relevance"),
-            )
-            for s in result.sources
-        ],
-        agent_reasoning=result.agent_reasoning,
-        query_steps=[
-            QueryStep(
-                round=step.get("round", 0),
-                tool=step.get("tool", ""),
-                input=step.get("input", {}),
-                output=step.get("output", {}),
-            )
-            for step in result.query_steps
-        ],
+    return StreamingResponse(
+        stream_query_agent(request.question, request.chat_history),
+        media_type="text/event-stream",
     )

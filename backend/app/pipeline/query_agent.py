@@ -342,26 +342,23 @@ QUERY_SYSTEM_PROMPT = (
     "6. You may chain multiple tools to answer complex questions.\n\n"
     "When you have enough information, return a clear, concise answer. "
     "Always cite which document(s) your answer came from. "
-    "Return your final answer as JSON:\n"
-    '{"answer": "Your natural language answer", '
-    '"sources": [{"document_id": "...", "filename": "...", "relevance": 0.95}], '
-    '"reasoning": "Brief explanation of how you found the answer"}'
+    "Return your final answer in the following XML format strictly:\n"
+    "<reasoning>Brief explanation of how you found the answer</reasoning>\n"
+    '<sources>[{"document_id": "...", "filename": "...", "relevance": 0.95}]</sources>\n'
+    "<answer>Your natural language answer</answer>"
 )
 
 MAX_QUERY_ROUNDS = 6
 
 
-async def run_query_agent(question: str, chat_history: list[dict[str, str]] | None = None) -> QueryResult:
+async def stream_query_agent(question: str, chat_history: list[dict[str, str]] | None = None):
     """
     Run the query agent to answer a natural language question.
     Uses LangChain to iteratively query the database and synthesize an answer.
     """
     if not settings.llm_available:
-        return QueryResult(
-            answer="LLM is not available. Please configure an API key.",
-            sources=[],
-            agent_reasoning="No LLM configured.",
-        )
+        yield f"data: {json.dumps({'type': 'done', 'sources': [], 'reasoning': 'No LLM configured.', 'steps': []})}\n\n"
+        return
 
     from app.utils.llm import get_llm
     from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
@@ -388,54 +385,59 @@ async def run_query_agent(question: str, chat_history: list[dict[str, str]] | No
             from app.utils.rate_limit import throttle_gemini_request
             await throttle_gemini_request()
             
-        resp = await llm_with_tools.ainvoke(messages)
-        messages.append(resp)
+        stream = llm_with_tools.astream(messages)
+        full_message = None
+        is_tool_call = False
         
-        if not resp.tool_calls:
-            # Done
-            try:
-                raw_content = resp.content
-                if isinstance(raw_content, list):
-                    raw_content = raw_content[0].get("text", "") if raw_content else ""
-                raw = str(raw_content).strip()
-                if raw.startswith("```"):
-                    raw = raw.split("```")[1]
-                    if raw.startswith("json"):
-                        raw = raw[4:]
-                if raw.endswith("```"):
-                    raw = raw[:-3]
-                data = json.loads(raw.strip())
-                return QueryResult(
-                    answer=data.get("answer", str(raw_content)),
-                    sources=data.get("sources", []),
-                    agent_reasoning=data.get("reasoning", ""),
-                    query_steps=agent_steps,
-                )
-            except (json.JSONDecodeError, KeyError):
-                return QueryResult(
-                    answer=str(resp.content),
-                    sources=[],
-                    agent_reasoning="Agent returned free-text answer.",
-                    query_steps=agent_steps,
-                )
+        async for chunk in stream:
+            if full_message is None:
+                full_message = chunk
+            else:
+                full_message += chunk
+                
+            if chunk.tool_call_chunks:
+                is_tool_call = True
+            elif chunk.content and not is_tool_call:
+                if isinstance(chunk.content, str):
+                    yield f"data: {json.dumps({'type': 'token', 'content': chunk.content})}\n\n"
+                    
+        messages.append(full_message)
+        
+        if not is_tool_call and not full_message.tool_calls:
+            # We are done! The final message was streamed.
+            # Parse the XML to extract sources and reasoning for the final event
+            import re
+            content = str(full_message.content)
+            
+            reasoning_match = re.search(r"<reasoning>(.*?)</reasoning>", content, re.DOTALL)
+            sources_match = re.search(r"<sources>(.*?)</sources>", content, re.DOTALL)
+            
+            reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+            sources = []
+            if sources_match:
+                try:
+                    sources = json.loads(sources_match.group(1).strip())
+                except json.JSONDecodeError:
+                    pass
+                    
+            yield f"data: {json.dumps({'type': 'done', 'sources': sources, 'reasoning': reasoning, 'steps': agent_steps})}\n\n"
+            return
                 
         # Execute tools
-        for tc in resp.tool_calls:
+        for tc in full_message.tool_calls:
             result = await _dispatch_query_tool(tc["name"], tc.get("args", {}))
-            agent_steps.append({
+            step = {
                 "round": round_num + 1,
                 "tool": tc["name"],
                 "input": tc.get("args", {}),
                 "output": result,
-            })
+            }
+            agent_steps.append(step)
+            yield f"data: {json.dumps({'type': 'step', 'content': step})}\n\n"
+            
             messages.append(ToolMessage(
                 tool_call_id=tc["id"],
                 content=json.dumps(result)
             ))
             
-    return QueryResult(
-        answer="I couldn't find a definitive answer. Please try rephrasing your question.",
-        sources=[],
-        agent_reasoning=f"Agent did not converge after {MAX_QUERY_ROUNDS} rounds.",
-        query_steps=agent_steps,
-    )
+    yield f"data: {json.dumps({'type': 'done', 'sources': [], 'reasoning': 'Agent did not converge.', 'steps': agent_steps})}\n\n"

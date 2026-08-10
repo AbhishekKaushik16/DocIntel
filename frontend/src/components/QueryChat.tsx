@@ -83,24 +83,72 @@ export default function QueryChat() {
         }),
       });
 
-      if (!res.ok) throw new Error('Query failed');
-      const data = await res.json();
-
-      const assistantMsg: Message = {
-        id: loadingMsg.id,
-        role: 'assistant',
-        content: data.answer,
-        sources: data.sources,
-        reasoning: data.agent_reasoning,
-        steps: data.query_steps,
-      };
-
-      setMessages((prev) =>
-        prev.map((m) => (m.id === loadingMsg.id ? assistantMsg : m))
-      );
+      if (!res.ok || !res.body) throw new Error('Query failed');
+      
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      
+      let done = false;
+      let currentContent = '';
+      let buffer = '';
+      
+      while (!done) {
+        const { value, done: readerDone } = await reader.read();
+        done = readerDone;
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          
+          let eolIndex;
+          while ((eolIndex = buffer.indexOf('\n\n')) >= 0) {
+            const eventString = buffer.slice(0, eolIndex).trim();
+            buffer = buffer.slice(eolIndex + 2);
+            
+            if (eventString.startsWith('data: ')) {
+              try {
+                const event = JSON.parse(eventString.slice(6));
+                
+                setMessages((prev) => 
+                  prev.map((m): Message => {
+                    if (m.id === loadingMsg.id) {
+                      if (event.type === 'token') {
+                        currentContent += event.content;
+                        let displayContent = currentContent;
+                        const match = currentContent.match(/<answer>([\s\S]*?)(?:<\/answer>|$)/);
+                        if (match) {
+                            displayContent = match[1] || "";
+                        } else if (currentContent.includes('<answer>')) {
+                            displayContent = currentContent.split('<answer>')[1] || "";
+                        } else if (currentContent.includes('<reasoning>') || currentContent.includes('<sources>')) {
+                            displayContent = "Processing...";
+                        } else {
+                            displayContent = currentContent;
+                        }
+                        return { ...m, content: displayContent, loading: false };
+                      } else if (event.type === 'step') {
+                        return { ...m, steps: [...(m.steps || []), event.content] };
+                      } else if (event.type === 'done') {
+                        return { 
+                          ...m, 
+                          sources: event.sources, 
+                          reasoning: event.reasoning,
+                          steps: event.steps,
+                          loading: false
+                        };
+                      }
+                    }
+                    return m;
+                  })
+                );
+              } catch (e) {
+                console.error("SSE parse error", e);
+              }
+            }
+          }
+        }
+      }
     } catch (err) {
       setMessages((prev) =>
-        prev.map((m) =>
+        prev.map((m): Message =>
           m.id === loadingMsg.id
             ? { ...m, content: 'Sorry, something went wrong. Please try again.', loading: false }
             : m
