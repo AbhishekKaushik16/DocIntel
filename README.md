@@ -10,15 +10,16 @@ DocIntel is an end-to-end web application that ingests unstructured and semi-str
 ## 🌟 Key Features
 
 - **Multi-Format Ingestion**: Supports PDF (text & scanned), Images (PNG, JPG, TIFF), DOCX, CSV, Excel, TXT, and Markdown.
-- **4-Stage Processing Pipeline**:
-  1. **Classify**: Intelligent document type classification (Invoice, Receipt, Contract, Resume, Generic).
+- **5-Stage Agentic Pipeline (LangGraph)**:
+  1. **Classify**: Intelligent document type classification.
   2. **Parse**: Hybrid PyMuPDF + Tesseract OCR layout preservation.
-  3. **Extract**: OpenAI structured JSON extraction with Pydantic schema enforcement.
-  4. **Validate**: Field completeness, cross-field consistency checks (e.g., invoice total validation), and composite confidence scoring.
+  3. **Extract**: Structured JSON extraction with schema enforcement.
+  4. **Validate**: Field completeness and cross-field consistency checks.
+  5. **Resolve**: ReAct agent that automatically corrects validation errors (e.g., math mistakes).
 - **Graceful Degradation**: Dual-mode extraction engine — if no OpenAI API key is configured, falls back seamlessly to rule-based regex extraction.
 - **Human-in-the-Loop Review**: Automated routing of low-confidence extractions (`0.5 <= confidence < 0.8`) to a dedicated review interface for manual field verification.
-- **Full-Text & Faceted Search**: Powered by PostgreSQL `tsvector` + GIN indexing with query highlighting and relevance ranking.
-- **Full Observability**: Comprehensive audit trail logging every stage, duration, warnings, and error messages per document.
+- **Hybrid Full-Text & Vector Search**: Powered by Elasticsearch (`flattened` mapping for dynamic JSON, `dense_vector` for semantic similarity search).
+- **Agentic Orchestration**: Uses LangGraph with `langgraph-checkpoint-postgres` for fault-tolerant state persistence. Celery workers run with `task_acks_late=True` for bulletproof retries.
 
 ---
 
@@ -28,14 +29,15 @@ DocIntel is an end-to-end web application that ingests unstructured and semi-str
 [ Frontend: Next.js 15 + React 19 + Tailwind CSS ]
                        │ (REST API)
                        ▼
-[ Backend: FastAPI (Python 3.12) + SQLModel / SQLAlchemy ]
+[ Backend: FastAPI (Python 3.12) ]
                        │
-         ┌─────────────┴─────────────┐
-         ▼                           ▼
-[ PostgreSQL 16 (JSONB + FTS) ]  [ Redis + Celery Task Queue ]
-                                     │ (Async Processing)
-                                     ▼
-                      [ Pipeline: Parse → Classify → Extract → Validate ]
+          ┌────────────┼─────────────┐
+          ▼            ▼             ▼
+  [ PostgreSQL ]  [ Redis ]   [ Elasticsearch ]
+ (State Checkpoint) (Celery)  (Hybrid Search)
+                       │
+                       ▼
+       [ LangGraph 5-Stage Agentic Pipeline ]
 ```
 
 | Layer | Technology |
@@ -43,9 +45,10 @@ DocIntel is an end-to-end web application that ingests unstructured and semi-str
 | **Frontend** | Next.js 15 (App Router), TypeScript, Tailwind CSS, Lucide Icons |
 | **Backend API** | FastAPI, Pydantic v2, SQLAlchemy (Async), asyncpg |
 | **Task Queue** | Celery + Redis |
-| **Database** | PostgreSQL 16 (JSONB for dynamic schemas, `tsvector` for FTS) |
-| **OCR & Parsing** | PyMuPDF, pytesseract (Tesseract OCR), python-docx, Pandas |
-| **LLM Engine** | OpenAI `gpt-4o-mini` (structured output JSON mode) |
+| **Database** | PostgreSQL 16 (LangGraph checkpointing & relations) |
+| **Search Engine**| Elasticsearch 8.15 (`flattened` mapping, 768-dim `dense_vector`) |
+| **OCR & Parsing** | PyMuPDF, pytesseract, python-docx, Pandas |
+| **LLM Engine** | LangGraph, Gemini `gemini-3-flash`, `models/gemini-embedding-2` |
 
 ---
 
@@ -100,11 +103,13 @@ zamp/
 │   │   ├── api/            # Route handlers (documents, search)
 │   │   ├── models/         # SQLAlchemy database models & schemas
 │   │   ├── pipeline/       # 4-stage processing pipeline
-│   │   │   ├── classifier.py   # Stage 1: Document classification
-│   │   │   ├── parser.py       # Stage 2: Layout parsing & OCR
-│   │   │   ├── extractor.py    # Stage 3: LLM & regex extraction
-│   │   │   ├── validator.py    # Stage 4: Confidence scoring & rules
-│   │   │   └── orchestrator.py # Pipeline coordinator
+│   │   │   ├── classifier.py   # Stage 1: Classification
+│   │   │   ├── parser.py       # Stage 2: Parsing & OCR
+│   │   │   ├── extractor.py    # Stage 3: Extraction
+│   │   │   ├── validator.py    # Stage 4: Validation
+│   │   │   ├── resolver.py     # Stage 5: ReAct Agent Resolution
+│   │   │   ├── graph.py        # LangGraph definitions
+│   │   │   └── orchestrator.py # Celery task entry point
 │   │   ├── config.py       # Pydantic environment settings
 │   │   ├── database.py     # Asyncpg connection session pool
 │   │   └── main.py         # FastAPI application entry point

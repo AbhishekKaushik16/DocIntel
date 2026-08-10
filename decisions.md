@@ -4,21 +4,21 @@ This is a running log of the real calls we made while building DocIntel, focusin
 
 ---
 
-## 1. Database Architecture: PostgreSQL Hybrid
+## 1. Database Architecture: PostgreSQL + Elasticsearch Hybrid
 
-*   **The decision:** We chose PostgreSQL 16 using a hybrid model: relational tables for state/metadata, `JSONB` for dynamically extracted fields, and `tsvector` for full-text search.
-*   **The alternatives:** MongoDB (good for JSON, bad for relational state/search), or a dual-DB setup like PostgreSQL + Elasticsearch.
-*   **The reasoning:** Document intelligence requires tracking a strict state machine (Processing $\rightarrow$ Needs Review $\rightarrow$ Completed) alongside highly unstructured extracted data. Postgres handles both perfectly. Using `JSONB` avoids schema migrations when new document types are added.
-*   **What you deliberately cut:** We deliberately cut a dedicated Vector DB (like Pinecone) or pgvector. We realized that querying extracted financial data requires SQL-like aggregations and exact keyword matches, not semantic similarity. A vector search would add latency and cost without actually solving the problem of querying structured tabular data.
+*   **The decision:** We chose PostgreSQL 16 for robust relational state and LangGraph checkpointing, paired with Elasticsearch 8.15 for hybrid vector and full-text search.
+*   **The alternatives:** Relying purely on Postgres `tsvector` and `pgvector`, or using a dedicated vector database like Pinecone.
+*   **The reasoning:** Document intelligence requires both strict state machine tracking (Postgres) and highly flexible schema-less search. We initially tried Postgres `JSONB` for search, but hit mapping explosion issues with deeply nested extracted data. Elasticsearch's `flattened` mapping solved the explosion, while its `dense_vector` support enabled hybrid semantic search natively.
+*   **What you deliberately cut:** We deliberately cut a dedicated standalone Vector DB (like Pinecone) to minimize infrastructure complexity, choosing Elasticsearch which perfectly handles both our full-text highlighting and dense vector needs in one service.
 
 ---
 
-## 2. Processing Architecture: Decoupled Async Pipeline
+## 2. Processing Architecture: LangGraph Agentic Pipeline
 
-*   **The decision:** We built a decoupled asynchronous pipeline using Celery + Redis, moving all document processing out of the main web thread.
-*   **The alternatives:** Synchronous HTTP request processing (e.g., awaiting the LLM call inside the FastAPI `/upload` endpoint), or using FastAPI `BackgroundTasks`.
-*   **The reasoning:** LLM API calls and OCR are fundamentally slow (often taking 3-4 minutes for 100-page PDFs) and prone to rate-limiting. A synchronous HTTP request would inevitably timeout in the browser. Celery allows us to implement retries, handle timeouts gracefully, and process large queues concurrently without crashing the API.
-*   **What you deliberately cut:** We deliberately cut real-time synchronous extraction. The UX trade-off is that users have to wait a few minutes and rely on a polling/WebSocket status update rather than getting an instant response, but the reliability gained for massive documents is worth it.
+*   **The decision:** We built a 5-stage decoupled asynchronous pipeline using Celery + Redis, orchestrated internally by **LangGraph** with state checkpointing via `langgraph-checkpoint-postgres`.
+*   **The alternatives:** A hardcoded linear Celery chain, or synchronous HTTP request processing.
+*   **The reasoning:** LLM API calls and OCR are fundamentally slow and prone to rate-limiting or random API drops. Standard Celery chains fail entirely on node crashes. By wrapping the pipeline in LangGraph, we achieved true stateful resumption—if a worker dies during the Extraction stage, it reloads the exact state graph from Postgres and resumes without needing to re-run OCR or Classification.
+*   **What you deliberately cut:** We deliberately cut real-time synchronous extraction. The UX trade-off is that users have to wait and rely on polling, but the bulletproof reliability gained for massive documents is worth it.
 
 ---
 
@@ -40,9 +40,9 @@ This is a running log of the real calls we made while building DocIntel, focusin
 
 ---
 
-## 5. UI/UX: Confidence Scoring & Human-in-the-Loop
+## 5. Resilience & Automation: The ReAct Resolver Agent
 
-*   **The decision:** We implemented an automated confidence scoring engine that routes extractions into a "Needs Review" state if the LLM confidence is `< 0.8`.
-*   **The alternatives:** Auto-approving all LLM extractions and assuming they are 100% correct.
-*   **The reasoning:** LLMs hallucinate, and OCR misreads numbers. In an enterprise setting, an incorrect invoice extraction can cost thousands of dollars. We explicitly designed a Human-in-the-Loop (HITL) UI where users can audit flagged documents and correct the JSON before it is finalized. 
-*   **What you deliberately cut:** We cut complex automated cross-validation math (e.g., using a Python solver to verify if line items sum exactly to the total amount considering tax variations). We opted for a simpler heuristic score combined with human review to maintain development velocity.
+*   **The decision:** Instead of solely relying on humans to fix validation errors, we introduced a 5th pipeline stage: a **Resolver Agent**.
+*   **The alternatives:** Hard-failing documents into a "Needs Review" queue the second a validation rule (e.g., "Subtotal + Tax != Total") fails.
+*   **The reasoning:** LLMs often make trivial math mistakes or hallucinate a digit. Forcing a human to review every minor hallucination defeats the purpose of automation. The Resolver Agent receives the exact validation errors and the raw text, uses a ReAct loop to diagnose the failure, and autonomously patches the JSON payload. It has a strict retry limit to prevent infinite loops.
+*   **What you deliberately cut:** We still kept the Human-in-the-Loop (HITL) UI for low-confidence scores (`< 0.8`), but we cut out human intervention for deterministic validation failures that the agent can mathematically prove and fix itself.
