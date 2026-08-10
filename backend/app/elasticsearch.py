@@ -211,7 +211,9 @@ async def search_documents(
                 }
             },
             "highlight": {
+                "require_field_match": False,
                 "fields": {
+                    "original_filename": {"fragment_size": 150, "number_of_fragments": 1},
                     "raw_text": {"fragment_size": 150, "number_of_fragments": 3},
                     "extracted_data.*": {"fragment_size": 150, "number_of_fragments": 2},
                 },

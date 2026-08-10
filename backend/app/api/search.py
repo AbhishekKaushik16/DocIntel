@@ -81,7 +81,7 @@ async def search_documents(
                 document_type=hit.get("document_type"),
                 status=DocumentStatus(hit.get("status", "pending")),
                 confidence_score=hit.get("confidence_score"),
-                relevance_score=round(hit.get("score", 0), 4),
+                relevance_score=round(hit.get("relevance_score", 0), 4),
                 headline=headline,
                 # Provide dummy or parsed date if actual date is needed; ES stores ISO format
                 created_at=datetime.datetime.fromisoformat(hit.get("created_at", datetime.datetime.now(datetime.timezone.utc).isoformat()).replace('Z', '+00:00')),
