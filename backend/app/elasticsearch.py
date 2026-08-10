@@ -53,7 +53,7 @@ INDEX_SETTINGS = {
             "indexed_at": {"type": "date"},
             "document_vector": {
                 "type": "dense_vector",
-                "dims": 768,
+                "dims": 3072,
                 "index": True,
                 "similarity": "cosine"
             },
