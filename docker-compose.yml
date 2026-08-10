@@ -119,7 +119,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: docintel-frontend
-    command: npm run dev
+    command: sh -c "npm run build && npm start"
     ports:
       - "3000:3000"
     volumes:
