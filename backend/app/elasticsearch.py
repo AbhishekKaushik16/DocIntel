@@ -143,6 +143,8 @@ async def search_documents(
     min_confidence: float | None = None,
     size: int = 20,
     from_: int = 0,
+    offset: int | None = None,
+    extra_filters: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Full-text + structured search over documents.
@@ -197,7 +199,10 @@ async def search_documents(
             filter_clauses.append({"term": {"status": status}})
         if min_confidence is not None:
             filter_clauses.append({"range": {"confidence_score": {"gte": min_confidence}}})
+        if extra_filters:
+            filter_clauses.extend(extra_filters)
 
+        actual_from = offset if offset is not None else from_
         body = {
             "query": {
                 "bool": {
@@ -214,7 +219,7 @@ async def search_documents(
                 "post_tags": ["</mark>"],
             },
             "size": size,
-            "from": from_,
+            "from": actual_from,
             "_source": {
                 "excludes": ["raw_text", "document_vector"],  # Don't return full text or vectors
             },
