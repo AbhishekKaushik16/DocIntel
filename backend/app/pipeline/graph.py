@@ -310,8 +310,8 @@ def build_pipeline() -> StateGraph:
     graph.add_edge("re_validate", "finalize")
     graph.add_edge("finalize", END)
 
-    return graph.compile()
+    return graph
 
 
-# Compiled pipeline instance
-pipeline = build_pipeline()
+# Compiled pipeline instance (without checkpointer, for backward compatibility / tests)
+pipeline = build_pipeline().compile()

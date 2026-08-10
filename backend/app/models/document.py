@@ -18,7 +18,7 @@ from sqlalchemy import (
     Boolean,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -27,7 +27,6 @@ from sqlalchemy.types import TypeDecorator, CHAR
 
 # Cross-database compatible types (PostgreSQL in production, SQLite fallback for unit tests)
 JSONType = JSONB().with_variant(JSON(), "sqlite")
-TSVectorType = TSVECTOR().with_variant(Text(), "sqlite")
 
 
 class UUIDType(TypeDecorator):
@@ -117,8 +116,6 @@ class Document(Base):
     raw_text = Column(Text, nullable=True)
     extracted_data = Column(JSONType, nullable=True, default=dict)
 
-    # Full-text search vector (populated by trigger)
-    search_vector = Column(TSVectorType, nullable=True)
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -146,7 +143,6 @@ class Document(Base):
     )
 
     __table_args__ = (
-        Index("idx_documents_search_vector", "search_vector", postgresql_using="gin"),
         Index("idx_documents_extracted_data", "extracted_data", postgresql_using="gin"),
         Index("idx_documents_created_at", "created_at"),
     )

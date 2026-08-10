@@ -58,46 +58,8 @@ async def _tool_search_documents(query: str, document_type: str | None = None, m
             ],
         }
     except Exception as e:
-        # Fallback to PostgreSQL full-text search
-        return await _tool_search_postgres_fallback(query, document_type, max_results)
+        return {"error": f"Search failed: {str(e)}", "total_matches": 0, "results": []}
 
-
-async def _tool_search_postgres_fallback(query: str, document_type: str | None, max_results: int) -> dict:
-    """Fallback search using PostgreSQL tsvector when ES is unavailable."""
-    from sqlalchemy import func, select, text
-    from app.database import async_session_factory
-    from app.models import Document
-
-    async with async_session_factory() as db:
-        ts_query = func.plainto_tsquery("english", query)
-        stmt = (
-            select(
-                Document.id,
-                Document.original_filename,
-                Document.document_type,
-                Document.confidence_score,
-                func.ts_rank_cd(Document.search_vector, ts_query).label("rank"),
-            )
-            .where(Document.search_vector.op("@@")(ts_query))
-        )
-        if document_type:
-            stmt = stmt.where(Document.document_type == document_type)
-        stmt = stmt.order_by(text("rank DESC")).limit(max_results)
-
-        result = await db.execute(stmt)
-        rows = result.all()
-        return {
-            "total_matches": len(rows),
-            "results": [
-                {
-                    "document_id": str(r.id),
-                    "filename": r.original_filename,
-                    "type": r.document_type,
-                    "confidence": r.confidence_score,
-                }
-                for r in rows
-            ],
-        }
 
 
 async def _tool_query_jsonb(json_path: str, value: str | None = None, operator: str = "contains") -> dict:

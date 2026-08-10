@@ -61,12 +61,18 @@ Located in `/backend/app/api/`. The primary gateway for the frontend.
 
 Located in `/backend/app/pipeline/`. This is the heavy-lifting engine of DocIntel.
 
-Since LLM calls and OCR are fundamentally slow, processing is entirely offloaded to background workers. The pipeline consists of 4 strictly defined stages:
+Since LLM calls and OCR are fundamentally slow, processing is entirely offloaded to background workers. The pipeline utilizes **LangGraph** to manage state routing and consists of 5 strictly defined stages:
 
-1.  **Classify (`classifier.py`)**: Determines if the document is an Invoice, Receipt, Contract, or Resume.
-2.  **Parse (`parser.py`)**: Extracts raw text using PyPDF2 or Tesseract OCR for images. Handles document chunking for massive files.
-3.  **Extract (`extractor.py`)**: The core AI logic. Uses LangChain and Instructor to force the LLM to return strictly typed JSON that maps to our Pydantic models. Includes a dual-mode fallback (if OpenRouter fails due to 402 errors, it instantly falls back to Google Gemini).
-4.  **Validate & Score**: Analyzes the extracted JSON, calculates a confidence score (e.g., verifying if invoice line items sum to the total), and sets the status to `COMPLETED` or `NEEDS_REVIEW`.
+1.  **Parse (`parser.py`)**: Extracts raw text using PyPDF2 or Tesseract OCR for images. Handles document chunking for massive files.
+2.  **Classify (`classifier.py`)**: Determines if the document is an Invoice, Receipt, Contract, or Resume using a fast LLM.
+3.  **Extract (`extractor.py`)**: The core AI logic. Uses LangChain and Instructor to force the LLM to return strictly typed JSON that maps to our Pydantic models. Includes a dual-mode fallback.
+4.  **Validate & Score (`validator.py`)**: Deterministically analyzes the extracted JSON and calculates a confidence score (e.g., verifying if invoice line items sum to the total).
+5.  **Resolve (`resolver.py`)**: **(The Agentic Loop)** If validation fails (e.g. line items don't match the total), the pipeline routes the state to the Resolver Agent. This agent is fed the raw text, the initial JSON, and the validation errors. It reasons about why the failure occurred (e.g., "The extractor missed a hidden tax row") and attempts to surgically fix the JSON payload. If it succeeds, the document skips human review. To prevent infinite loops under adversarial or malformed input, the agent is strictly capped at `MAX_RESOLVER_ROUNDS` (currently 4 attempts). If it fails to converge within this limit, it safely escalates the document to `NEEDS_REVIEW`.
+
+### Fault Tolerance & Checkpointing
+If a Celery worker dies (e.g., OOM kill during a massive PDF parse) mid-document:
+*   **Current State**: Celery is configured with `task_acks_late=True`. The broker will not acknowledge the message until the task fully completes. If the worker dies, the task is redelivered to another worker and the LangGraph pipeline restarts from scratch.
+*   **Future Roadmap**: Because we utilize LangGraph, the architecture is primed to adopt `langgraph-checkpoint-postgres` (`PostgresSaver`). This will enable **node-level resumption** — meaning if a worker dies during the Extraction step, the new worker will resume from Extraction using the saved state, without needing to re-run the expensive Parse (OCR) step.
 
 ---
 
@@ -78,7 +84,9 @@ Located in `/backend/app/models/` and `/backend/app/database.py`.
 We use a single powerful database to handle two very different types of data:
 1.  **Relational State**: The `documents` table stores strictly typed metadata (`status`, `document_type`, `original_filename`, `confidence_score`).
 2.  **Unstructured Data**: The `extracted_data` column is a `JSONB` field. This allows us to store wildly different schemas (an Invoice looks nothing like a Resume) in the same table without requiring database migrations.
-3.  **Fast Keyword Filtering**: We utilize Postgres `tsvector` and GIN indexing on the raw text for lightning-fast keyword matching when building SQL queries.
+
+> [!NOTE]
+> **Architectural Decision**: We intentionally dropped PostgreSQL `tsvector` and GIN text indexing. To eliminate redundant infrastructure and establish a strict separation of concerns, 100% of full-text keyword and semantic vector search duties have been consolidated onto Elasticsearch. PostgreSQL is now exclusively used for state management and source-of-truth storage.
 
 ---
 

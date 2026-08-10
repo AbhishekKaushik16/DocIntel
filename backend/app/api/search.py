@@ -1,15 +1,16 @@
-"""Search API — full-text search with faceted filtering over extracted documents."""
+"""Search API — hybrid search over extracted documents via Elasticsearch."""
 
-import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, text, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Document, DocumentStatus
+from app.models import DocumentStatus
 from app.schemas import SearchResponse, SearchResult
+from app.elasticsearch import search_documents as es_search_documents
+import uuid
+import datetime
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -24,69 +25,68 @@ async def search_documents(
     min_confidence: float | None = Query(None, ge=0, le=1),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db),  # Kept for dependency injection compatibility, though unused
 ):
     """
-    Full-text search across all documents using PostgreSQL tsvector.
+    Hybrid semantic + keyword search across all documents using Elasticsearch.
 
     Supports:
-    - Natural language queries with stemming and ranking
+    - Natural language queries via embedding kNN search
+    - Keyword matching
     - Faceted filtering by document type, status, date range, confidence
     - Relevance-ranked results with highlighted snippets
     """
-    # Build the tsquery from the user's input
-    # plainto_tsquery handles natural language input gracefully
-    ts_query = func.plainto_tsquery("english", q)
-
-    # Base query: match against search_vector
-    query = select(
-        Document,
-        func.ts_rank_cd(Document.search_vector, ts_query).label("relevance_score"),
-        func.ts_headline(
-            "english",
-            func.coalesce(Document.raw_text, cast(Document.original_filename, String)),
-            ts_query,
-            text("'StartSel=<mark>, StopSel=</mark>, MaxWords=50, MinWords=20'"),
-        ).label("headline"),
-    ).where(Document.search_vector.op("@@")(ts_query))
-
-    # Apply filters
-    if type_filter:
-        query = query.where(Document.document_type == type_filter)
+    # Build Elasticsearch filter list
+    filters = []
+    
     if status_filter:
-        query = query.where(Document.status == status_filter)
-    if date_from:
-        query = query.where(func.date(Document.created_at) >= date_from)
-    if date_to:
-        query = query.where(func.date(Document.created_at) <= date_to)
+        filters.append({"term": {"status": status_filter.value if hasattr(status_filter, "value") else str(status_filter)}})
+        
     if min_confidence is not None:
-        query = query.where(Document.confidence_score >= min_confidence)
+        filters.append({"range": {"confidence_score": {"gte": min_confidence}}})
+        
+    if date_from or date_to:
+        date_range = {}
+        if date_from:
+            date_range["gte"] = date_from.isoformat()
+        if date_to:
+            date_range["lte"] = date_to.isoformat()
+        filters.append({"range": {"created_at": date_range}})
 
-    # Count total results
-    count_subq = query.subquery()
-    count_result = await db.execute(select(func.count()).select_from(count_subq))
-    total = count_result.scalar() or 0
+    # Execute search against Elasticsearch
+    es_result = await es_search_documents(
+        query=q,
+        document_type=type_filter,
+        size=per_page,
+        offset=(page - 1) * per_page,
+        extra_filters=filters if filters else None,
+    )
 
-    # Order by relevance, paginate
-    query = query.order_by(text("relevance_score DESC"))
-    query = query.offset((page - 1) * per_page).limit(per_page)
+    total = es_result.get("total", 0)
+    hits = es_result.get("hits", [])
 
-    result = await db.execute(query)
-    rows = result.all()
+    results = []
+    for hit in hits:
+        # Create headline from highlights
+        highlights = hit.get("highlights", {})
+        headline_parts = []
+        for field, texts in highlights.items():
+            headline_parts.extend(texts)
+        headline = " ... ".join(headline_parts) if headline_parts else None
 
-    results = [
-        SearchResult(
-            id=row.Document.id,
-            original_filename=row.Document.original_filename,
-            document_type=row.Document.document_type,
-            status=row.Document.status,
-            confidence_score=row.Document.confidence_score,
-            relevance_score=round(row.relevance_score, 4) if row.relevance_score else None,
-            headline=row.headline,
-            created_at=row.Document.created_at,
+        results.append(
+            SearchResult(
+                id=uuid.UUID(hit.get("document_id")),
+                original_filename=hit.get("original_filename", ""),
+                document_type=hit.get("document_type"),
+                status=DocumentStatus(hit.get("status", "pending")),
+                confidence_score=hit.get("confidence_score"),
+                relevance_score=round(hit.get("score", 0), 4),
+                headline=headline,
+                # Provide dummy or parsed date if actual date is needed; ES stores ISO format
+                created_at=datetime.datetime.fromisoformat(hit.get("created_at", datetime.datetime.now(datetime.timezone.utc).isoformat()).replace('Z', '+00:00')),
+            )
         )
-        for row in rows
-    ]
 
     return SearchResponse(
         results=results,

@@ -29,7 +29,7 @@ from app.models import (
     ProcessingLog,
     StageStatus,
 )
-from app.pipeline.graph import pipeline, PipelineState
+from app.pipeline.graph import build_pipeline, PipelineState
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -196,13 +196,36 @@ async def process_document(document_id: str) -> None:
             if document is None:
                 return
 
-            # ── Invoke LangGraph pipeline ─────────────────────────────────────
-            initial_state: PipelineState = {
-                "document_id": document_id,
-                "file_path": str(document.file_path),
-            }
+            # ── Invoke LangGraph pipeline (with Checkpointing) ────────────────
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            
+            # psycopg requires postgresql:// instead of postgresql+asyncpg://
+            psycopg_url = settings.database_url.replace("+asyncpg", "")
+            
+            async with AsyncPostgresSaver.from_conn_string(psycopg_url) as checkpointer:
+                await checkpointer.setup()
+                
+                pipeline_graph = build_pipeline()
+                app = pipeline_graph.compile(checkpointer=checkpointer)
+                
+                config = {"configurable": {"thread_id": str(doc_uuid)}}
+                
+                initial_state: PipelineState = {
+                    "document_id": document_id,
+                    "file_path": str(document.file_path),
+                }
 
-            final_state = await pipeline.ainvoke(initial_state)
+                # Check if we are resuming from a crashed state
+                existing_state = await app.aget_state(config)
+                
+                if existing_state and existing_state.values:
+                    import logging
+                    logging.info(f"Resuming pipeline for {doc_uuid} from state: {existing_state.next}")
+                    # Resume using existing state
+                    final_state = await app.ainvoke(None, config)
+                else:
+                    # Fresh run
+                    final_state = await app.ainvoke(initial_state, config)
 
             # ── Persist results to DB ─────────────────────────────────────────
 
@@ -228,34 +251,6 @@ async def process_document(document_id: str) -> None:
             await _persist_pipeline_logs(db, doc_uuid, final_state)
 
             await db.commit()
-
-            # ── Update full-text search vector (non-fatal) ────────────────────
-            try:
-                search_parts = [document.raw_text or ""]
-                if document.extracted_data:
-                    for v in document.extracted_data.values():
-                        if isinstance(v, str):
-                            search_parts.append(v)
-                        elif isinstance(v, list):
-                            for item in v:
-                                if isinstance(item, str):
-                                    search_parts.append(item)
-                                elif isinstance(item, dict):
-                                    search_parts.extend(
-                                        str(val) for val in item.values()
-                                        if val and isinstance(val, str)
-                                    )
-
-                await db.execute(
-                    text(
-                        "UPDATE documents SET search_vector = to_tsvector('english', :txt) "
-                        "WHERE id = :doc_id"
-                    ),
-                    {"txt": " ".join(search_parts)[:100_000], "doc_id": str(doc_uuid)},
-                )
-                await db.commit()
-            except Exception:
-                pass  # Non-fatal
 
             # ── Index to Elasticsearch (non-fatal) ────────────────────────────
             try:
