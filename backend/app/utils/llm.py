@@ -39,32 +39,12 @@ def get_llm(model_type: str = "fast", temperature: float = 0.0) -> BaseChatModel
     raise ValueError(f"Unsupported LLM provider: {provider}")
 
 def get_embeddings():
-    """Get the embeddings model based on the active provider."""
-    provider = settings.llm_provider.lower()
-    
-    if provider == "gemini":
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-        return GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001", 
-            google_api_key=settings.gemini_api_key
-        )
-    elif provider == "openai":
-        from langchain_openai import OpenAIEmbeddings
-        return OpenAIEmbeddings(
-            model="text-embedding-3-small", 
-            dimensions=768, 
-            openai_api_key=settings.openai_api_key
-        )
-    elif provider == "openrouter":
-        # OpenRouter does not provide standard embeddings. 
-        # We fallback to Gemini if available, since it's free.
-        if settings.gemini_api_key:
-            from langchain_google_genai import GoogleGenerativeAIEmbeddings
-            return GoogleGenerativeAIEmbeddings(
-                model="models/gemini-embedding-001", 
-                google_api_key=settings.gemini_api_key
-            )
-        else:
-            raise ValueError("OpenRouter is the active provider, but no GEMINI_API_KEY is available for embedding fallback.")
-    
-    raise ValueError(f"Unsupported LLM provider for embeddings: {provider}")
+    """Get the embeddings model. Standardized strictly on Gemini to prevent vector space fragmentation."""
+    if not settings.gemini_api_key:
+        raise ValueError("GEMINI_API_KEY is required for generating embeddings, even if another provider is used for extraction.")
+        
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    return GoogleGenerativeAIEmbeddings(
+        model="models/text-embedding-004", 
+        google_api_key=settings.gemini_api_key
+    )

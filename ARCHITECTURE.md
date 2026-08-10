@@ -102,7 +102,7 @@ LLMs are unpredictable and occasionally hallucinate data types (e.g., returning 
 
 ### 2. Semantic Hybrid Search (kNN)
 To allow users to query documents conceptually (e.g. *"contracts about liability caps"*) rather than relying purely on exact keyword matches, we implemented native Semantic Search:
-*   **Embeddings**: During the Celery extraction stage, a semantic summary of the document's content and structured JSON is embedded into a 768-dimensional vector using Gemini (`models/text-embedding-004`) or OpenAI (`text-embedding-3-small`).
+*   **Embeddings**: During the Celery extraction stage, a semantic summary of the document's content and structured JSON is embedded into a 768-dimensional vector using Gemini (`models/text-embedding-004`). We standardized strictly on the Gemini model to ensure a consistent, unfragmented vector space across the entire cluster, even when the primary extraction LLM (via OpenRouter) changes.
 *   **Vector Indexing**: The embedding is saved to the `document_vector` field in ES, which is mapped as a `dense_vector` with cosine similarity indexing.
 *   **Hybrid Queries**: When the `search_documents` LangChain tool is invoked, the user's natural language query is embedded. Elasticsearch natively executes a hybrid search by combining a `knn` vector query (for conceptual relevance) alongside a `multi_match` boolean query (for exact keyword/filename matches).
 ---
