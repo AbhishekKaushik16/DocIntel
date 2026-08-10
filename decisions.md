@@ -1,87 +1,48 @@
-# Architectural Decisions & Trade-Off Log (`decisions.md`)
+# Architectural Decisions (`decisions.md`)
 
-This document records the architectural and design decisions made during the 5-day build of the **Document Intelligence Platform** (Problem Statement 3: *"Turn messy documents into structured, queryable data"*).
-
----
-
-## Decision 1: PostgreSQL (JSONB + tsvector) vs MongoDB vs Polyglot Search
-
-### The Decision
-We chose **PostgreSQL 16** with a hybrid data model:
-1. Standard relational tables for document state, processing audit logs, and normalized extracted fields.
-2. `JSONB` column for dynamic per-type extracted structures.
-3. `tsvector` + GIN indexing for built-in Full-Text Search (FTS).
-
-### Alternatives Considered
-- **MongoDB (Pure Document Database)**: Considered because invoice/resume extractions fit MongoDB's native JSON document model cleanly.
-- **Dual-DB (PostgreSQL + Elasticsearch / Meilisearch)**: Considered for production-grade typo tolerance and faceted search.
-- **SQLite (with JSON1 + FTS5)**: Considered for zero-dependency local execution.
-
-### Reasoning & Trade-offs
-- **Why Postgres won**: In a document intelligence pipeline, data falls into two distinct categories: *relational pipeline metadata* (status state machine, audit logs, confidence scores) and *semi-structured document extractions*. PostgreSQL supports both natively in a single container. Its `tsvector` FTS with GIN indexing eliminates the need to run and sync a separate search daemon (like Elasticsearch).
-- **Trade-offs accepted**: Schema validation on `JSONB` columns must be handled at the application layer using Pydantic schemas rather than database-level constraints. Complex JSON array query syntax (`jsonb_path_query`) is slightly more verbose than MongoDB query syntax.
+This is a running log of the real calls we made while building DocIntel, focusing on judgment under ambiguity and time pressure.
 
 ---
 
-## Decision 2: 4-Stage Async Pipeline with Celery vs Direct Synchronous API Extraction
+## 1. Database Architecture: PostgreSQL Hybrid
 
-### The Decision
-We implemented a **4-stage decoupled asynchronous processing pipeline** (Classify $\rightarrow$ Parse $\rightarrow$ Extract $\rightarrow$ Validate) backed by **Celery + Redis** with WebSockets for real-time UI updates.
-
-### Alternatives Considered
-- **Synchronous HTTP Request/Response**: Process the document inside the `POST /api/documents/upload` route handler.
-- **FastAPI BackgroundTasks**: Light async background task execution without Redis.
-
-### Reasoning & Trade-offs
-- **Why Celery + 4 Stages won**: OCR and LLM API calls are slow and can fail or hit rate limits. Blocking the HTTP upload request leads to timeouts and poor UX. By decoupling into 4 distinct logged stages:
-  1. *Classify*: Determines format and document type (invoice, receipt, contract, resume, generic).
-  2. *Parse*: Formats PDF, images, DOCX, CSV into clean text (with Tesseract OCR fallback).
-  3. *Extract*: LLM schema extraction or regex fallback.
-  4. *Validate*: Calculates composite confidence scores & cross-field consistency checks.
-- **Trade-offs accepted**: Requires running Redis and Celery worker processes alongside the FastAPI server.
+*   **The decision:** We chose PostgreSQL 16 using a hybrid model: relational tables for state/metadata, `JSONB` for dynamically extracted fields, and `tsvector` for full-text search.
+*   **The alternatives:** MongoDB (good for JSON, bad for relational state/search), or a dual-DB setup like PostgreSQL + Elasticsearch.
+*   **The reasoning:** Document intelligence requires tracking a strict state machine (Processing $\rightarrow$ Needs Review $\rightarrow$ Completed) alongside highly unstructured extracted data. Postgres handles both perfectly. Using `JSONB` avoids schema migrations when new document types are added.
+*   **What you deliberately cut:** We deliberately cut a dedicated Vector DB (like Pinecone) or pgvector. We realized that querying extracted financial data requires SQL-like aggregations and exact keyword matches, not semantic similarity. A vector search would add latency and cost without actually solving the problem of querying structured tabular data.
 
 ---
 
-## Decision 3: Multi-Mode Extractor (LLM Structured Outputs + Dual-Mode Fallback)
+## 2. Processing Architecture: Decoupled Async Pipeline
 
-### The Decision
-We built a **hybrid extraction engine**:
-1. **Primary**: OpenAI `gpt-4o-mini` with Pydantic JSON mode schema enforcement.
-2. **Fallback**: Rule-based regex extractor for dates, currency amounts, emails, phone numbers, and URLs when no API key is provided or when rate limits/network errors occur.
-
-### Alternatives Considered
-- **LLM-only**: Reject documents if no OpenAI API key is set.
-- **Local Open-Source LLM (Ollama/vLLM)**: Run Qwen-VL or Llama 3 locally.
-
-### Reasoning & Trade-offs
-- **Why Dual-Mode won**: Real-world software must degrade gracefully. If a evaluator tests the repo without providing an OpenAI API key, the system still operates using regex heuristics rather than crashing with 500 errors.
-- **Why local LLMs were rejected**: Running vLLM/Ollama requires 8GB+ GPU VRAM, which creates friction for evaluators running `docker-compose up` on standard laptops.
+*   **The decision:** We built a decoupled asynchronous pipeline using Celery + Redis, moving all document processing out of the main web thread.
+*   **The alternatives:** Synchronous HTTP request processing (e.g., awaiting the LLM call inside the FastAPI `/upload` endpoint), or using FastAPI `BackgroundTasks`.
+*   **The reasoning:** LLM API calls and OCR are fundamentally slow (often taking 3-4 minutes for 100-page PDFs) and prone to rate-limiting. A synchronous HTTP request would inevitably timeout in the browser. Celery allows us to implement retries, handle timeouts gracefully, and process large queues concurrently without crashing the API.
+*   **What you deliberately cut:** We deliberately cut real-time synchronous extraction. The UX trade-off is that users have to wait a few minutes and rely on a polling/WebSocket status update rather than getting an instant response, but the reliability gained for massive documents is worth it.
 
 ---
 
-## Decision 4: Confidence Scoring & Human-in-the-Loop (HITL) Workflow
+## 3. Resilience: Multi-Provider LLM Fallback
 
-### The Decision
-We built an automated **confidence scoring engine** that routes documents into three status buckets:
-- `confidence >= 0.8` $\rightarrow$ `completed` (auto-approved)
-- `0.5 <= confidence < 0.8` $\rightarrow$ `needs_review` (flagged for human review)
-- `confidence < 0.5` $\rightarrow$ `failed`
-
-We created a dedicated **Human Review Interface** in the UI where users can edit and save corrected fields, updating the audit trail.
-
-### Alternatives Considered
-- Direct auto-approval of all LLM extractions without scoring or human review.
-
-### Reasoning & Trade-offs
-- **Why HITL won**: This directly addresses the **"Above and Beyond"** evaluation criterion (*"You solved a hard sub-problem others avoid"*). LLMs hallucinate and OCR misreads characters. Building a feedback loop where humans can verify and correct low-confidence extractions makes the system production-grade.
-- **Cross-validation math**: Invoices check if `total_amount ≈ subtotal + tax_amount` and `total_amount ≈ sum(line_items)`. Passing these rules boosts the confidence score.
+*   **The decision:** We implemented an abstraction layer that allows the system to seamlessly swap between OpenAI (via OpenRouter) and Google Gemini based on `.env` configuration or runtime errors.
+*   **The alternatives:** Hardcoding the OpenAI SDK and failing the pipeline if OpenAI is down or out of credits.
+*   **The reasoning:** We hit real-world failure modes immediately: OpenRouter threw `402 Payment Required` errors when we ran out of credits during a 114-page PDF extraction. By abstracting the LLM client, we caught the error, saved partial progress, and instantly failed over to a cheaper Gemini model without having to rewrite the extraction logic.
+*   **What you deliberately cut:** We cut support for local open-source models (like Ollama/vLLM). While running Llama 3 locally is cheaper, it requires 8GB+ GPU VRAM, making it impossible for a reviewer to run the stack via `docker-compose up` on a standard laptop.
 
 ---
 
-## What We Deliberately Cut (and Why)
+## 4. Query Engine: Agentic LangChain vs Naïve RAG
 
-| Cut Feature | Reason for Cutting |
-| :--- | :--- |
-| **Multi-Tenant Authentication & User Auth** | Adds zero value to the core technical problem of document extraction and queryability. We focused 100% of our velocity on pipeline depth and UX polish. |
-| **Vector / Semantic Search (pgvector)** | PostgreSQL `tsvector` full-text search already fulfills the search and query requirement cleanly. Adding vector embeddings increases build time and LLM costs without adding fundamental utility to structured JSON data queries. |
-| **Custom Schema Builder** | Allowing users to define arbitrary extraction templates on the fly is a complex product feature. We supported 5 rich pre-built domain schemas (Invoice, Receipt, Contract, Resume, Generic) instead. |
+*   **The decision:** We built a conversational Query Agent using LangChain equipped with custom tools (`search_documents`, `query_jsonb`, `aggregate_stats`).
+*   **The alternatives:** A standard RAG (Retrieval-Augmented Generation) pipeline that simply chunks text, embeds it, and injects the top 5 chunks into an LLM prompt.
+*   **The reasoning:** Standard RAG is terrible at analytical questions like *"How many invoices did Amazon send?"* or *"What is the average confidence score?"*. By giving the LLM agent tools to write SQL/JSONB queries against the Postgres database and aggregations, the system can autonomously route semantic questions to full-text search and analytical questions to the database. We also added conversational memory so users can ask follow-ups.
+*   **What you deliberately cut:** We cut complex cross-document semantic synthesis (e.g. comparing the abstract meaning of two 100-page contracts). We optimized the agent specifically for querying the *structured data* we worked so hard to extract.
+
+---
+
+## 5. UI/UX: Confidence Scoring & Human-in-the-Loop
+
+*   **The decision:** We implemented an automated confidence scoring engine that routes extractions into a "Needs Review" state if the LLM confidence is `< 0.8`.
+*   **The alternatives:** Auto-approving all LLM extractions and assuming they are 100% correct.
+*   **The reasoning:** LLMs hallucinate, and OCR misreads numbers. In an enterprise setting, an incorrect invoice extraction can cost thousands of dollars. We explicitly designed a Human-in-the-Loop (HITL) UI where users can audit flagged documents and correct the JSON before it is finalized. 
+*   **What you deliberately cut:** We cut complex automated cross-validation math (e.g., using a Python solver to verify if line items sum exactly to the total amount considering tax variations). We opted for a simpler heuristic score combined with human review to maintain development velocity.

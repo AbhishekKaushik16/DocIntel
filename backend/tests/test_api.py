@@ -62,3 +62,32 @@ async def test_dashboard_stats(client):
     assert "total_documents" in stats
     assert "completed" in stats
     assert "needs_review" in stats
+
+
+@pytest.mark.asyncio
+async def test_query_endpoint(client, monkeypatch):
+    # Mock the run_query_agent to avoid hitting real LLM
+    from app.pipeline.query_agent import QueryResult
+    
+    async def mock_run_query_agent(question, chat_history=None):
+        return QueryResult(
+            answer=f"Mocked answer for: {question}",
+            sources=[{"document_id": "123", "filename": "mock.pdf", "relevance": 0.99}],
+            agent_reasoning="I used the mock tool.",
+            query_steps=[{"round": 1, "tool": "mock_tool", "input": {}, "output": {}}]
+        )
+
+    monkeypatch.setattr("app.pipeline.query_agent.run_query_agent", mock_run_query_agent)
+
+    payload = {
+        "question": "What is the total revenue?",
+        "chat_history": [{"role": "user", "content": "Hello"}]
+    }
+    response = await client.post("/api/query", json=payload)
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"] == "Mocked answer for: What is the total revenue?"
+    assert len(data["sources"]) == 1
+    assert data["sources"][0]["filename"] == "mock.pdf"
+    assert data["agent_reasoning"] == "I used the mock tool."
