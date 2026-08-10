@@ -260,6 +260,25 @@ async def process_document(document_id: str) -> None:
             # ── Index to Elasticsearch (non-fatal) ────────────────────────────
             try:
                 from app.elasticsearch import index_document
+                from app.utils.llm import get_embeddings
+                
+                # Generate semantic summary
+                summary_parts = [f"Filename: {document.original_filename}", f"Type: {document.document_type}"]
+                if document.extracted_data:
+                    import json
+                    summary_parts.append(f"Data: {json.dumps(document.extracted_data)}")
+                summary_parts.append(f"Content: {(document.raw_text or '')[:1000]}")
+                summary_text = " | ".join(summary_parts)
+                
+                # Generate embeddings
+                document_vector = None
+                try:
+                    embeddings = get_embeddings()
+                    document_vector = await embeddings.aembed_query(summary_text)
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Failed to generate document vector for {doc_uuid}: {e}")
+
                 await index_document(
                     document_id=str(doc_uuid),
                     original_filename=document.original_filename,
@@ -268,9 +287,12 @@ async def process_document(document_id: str) -> None:
                     confidence_score=document.confidence_score,
                     raw_text=document.raw_text,
                     extracted_data=document.extracted_data,
+                    document_vector=document_vector,
                     created_at=document.created_at,
                 )
-            except Exception:
+            except Exception as e:
+                import logging
+                logging.warning(f"Failed ES indexing for {doc_uuid}: {e}")
                 pass  # Non-fatal — ES may not be running
 
         except Exception as e:

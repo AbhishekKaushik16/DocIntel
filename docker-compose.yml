@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U docintel"]
+      test: [ "CMD-SHELL", "pg_isready -U docintel" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -24,7 +24,7 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -42,7 +42,7 @@ services:
     volumes:
       - es_data:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      test: [ "CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -81,8 +81,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
-      GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3.5-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3-flash}
+      GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3-flash}
       OPEN_ROUTER_API_KEY: ${OPEN_ROUTER_API_KEY:-}
       OPEN_ROUTER_MODEL: ${OPEN_ROUTER_MODEL:-openai/gpt-4o-mini}
       OPEN_ROUTER_STRONG_MODEL: ${OPEN_ROUTER_STRONG_MODEL:-openai/gpt-4o}
@@ -113,8 +113,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
-      GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3.5-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3-flash}
+      GEMINI_STRONG_MODEL: ${GEMINI_STRONG_MODEL:-gemini-3-flash}
       OPEN_ROUTER_API_KEY: ${OPEN_ROUTER_API_KEY:-}
       OPEN_ROUTER_MODEL: ${OPEN_ROUTER_MODEL:-openai/gpt-4o-mini}
       OPEN_ROUTER_STRONG_MODEL: ${OPEN_ROUTER_STRONG_MODEL:-openai/gpt-4o}

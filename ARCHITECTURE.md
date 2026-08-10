@@ -78,7 +78,7 @@ Located in `/backend/app/models/` and `/backend/app/database.py`.
 We use a single powerful database to handle two very different types of data:
 1.  **Relational State**: The `documents` table stores strictly typed metadata (`status`, `document_type`, `original_filename`, `confidence_score`).
 2.  **Unstructured Data**: The `extracted_data` column is a `JSONB` field. This allows us to store wildly different schemas (an Invoice looks nothing like a Resume) in the same table without requiring database migrations.
-3.  **Full Text Search (FTS)**: We utilize Postgres `tsvector` and GIN indexing on the raw text for lightning-fast keyword matching.
+3.  **Fast Keyword Filtering**: We utilize Postgres `tsvector` and GIN indexing on the raw text for lightning-fast keyword matching when building SQL queries.
 
 ---
 
@@ -88,10 +88,15 @@ Located in `/backend/app/elasticsearch.py`.
 
 While Postgres handles the relational state, Elasticsearch is utilized for deep analytical queries over the unstructured JSON.
 
-### The Mapping Explosion Fix
+### 1. The Mapping Explosion Fix
 LLMs are unpredictable and occasionally hallucinate data types (e.g., returning an `address` as a string today, and a nested JSON object tomorrow). This traditionally crashes Elasticsearch (a "Mapping Explosion"). 
 **Architecture Fix**: We defined the `extracted_data` field mapping as `flattened` in Elasticsearch. This prevents ES from dynamically indexing every unpredictable nested sub-field, protecting the cluster's stability while still allowing leaf-node searches.
 
+### 2. Semantic Hybrid Search (kNN)
+To allow users to query documents conceptually (e.g. *"contracts about liability caps"*) rather than relying purely on exact keyword matches, we implemented native Semantic Search:
+*   **Embeddings**: During the Celery extraction stage, a semantic summary of the document's content and structured JSON is embedded into a 768-dimensional vector using Gemini (`models/text-embedding-004`) or OpenAI (`text-embedding-3-small`).
+*   **Vector Indexing**: The embedding is saved to the `document_vector` field in ES, which is mapped as a `dense_vector` with cosine similarity indexing.
+*   **Hybrid Queries**: When the `search_documents` LangChain tool is invoked, the user's natural language query is embedded. Elasticsearch natively executes a hybrid search by combining a `knn` vector query (for conceptual relevance) alongside a `multi_match` boolean query (for exact keyword/filename matches).
 ---
 
 ## 7. The Agentic Query Engine (LangChain)
@@ -101,7 +106,7 @@ Located in `/backend/app/pipeline/query_agent.py`.
 This is not a simple RAG (Retrieval-Augmented Generation) system. Standard RAG fails at answering analytical questions (like *"What is the total revenue across all invoices?"*). 
 
 We built a **ReAct (Reasoning + Acting) Agent**:
-*   **The Brain**: Uses OpenAI `gpt-4o` or Gemini `3.5-flash`.
+*   **The Brain**: Uses OpenAI `gpt-4o` or Gemini `2.5-flash-lite`.
 *   **The Tools**: The agent is equipped with a toolbox of Python functions it can call autonomously:
     1.  `search_documents`: Used when the user asks semantic or keyword questions.
     2.  `query_jsonb`: The agent writes valid PostgreSQL JSON path queries to filter documents based on deeply nested extracted data.

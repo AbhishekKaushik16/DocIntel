@@ -51,6 +51,12 @@ INDEX_SETTINGS = {
             "extracted_data": {"type": "object", "dynamic": True},
             "created_at": {"type": "date"},
             "indexed_at": {"type": "date"},
+            "document_vector": {
+                "type": "dense_vector",
+                "dims": 768,
+                "index": True,
+                "similarity": "cosine"
+            },
         },
     },
 }
@@ -97,6 +103,7 @@ async def index_document(
     confidence_score: float | None,
     raw_text: str | None,
     extracted_data: dict[str, Any] | None,
+    document_vector: list[float] | None,
     created_at: datetime | None,
 ) -> None:
     """Index a processed document into Elasticsearch."""
@@ -112,6 +119,7 @@ async def index_document(
             "confidence_score": confidence_score,
             "raw_text": (raw_text or "")[:100_000],  # Limit raw text size
             "extracted_data": extracted_data or {},
+            "document_vector": document_vector,
             "created_at": created_at.isoformat() if created_at else None,
             "indexed_at": datetime.utcnow().isoformat(),
         }
@@ -150,7 +158,25 @@ async def search_documents(
         filter_clauses = []
 
         # Full-text query across multiple fields
+        knn_clause = None
         if query:
+            try:
+                from app.utils.llm import get_embeddings
+                embeddings = get_embeddings()
+                # Run sync embed_query in an executor or use aembed_query if available
+                # Fallback to embed_query for safety if aembed_query not implemented by some providers
+                query_vector = await embeddings.aembed_query(query)
+                
+                knn_clause = {
+                    "field": "document_vector",
+                    "query_vector": query_vector,
+                    "k": size,
+                    "num_candidates": 100,
+                    "boost": 0.5
+                }
+            except Exception as e:
+                logger.warning(f"Could not generate query embedding for semantic search: {e}")
+
             must_clauses.append({
                 "multi_match": {
                     "query": query,
@@ -190,9 +216,13 @@ async def search_documents(
             "size": size,
             "from": from_,
             "_source": {
-                "excludes": ["raw_text"],  # Don't return full text in search results
+                "excludes": ["raw_text", "document_vector"],  # Don't return full text or vectors
             },
         }
+
+        # Add kNN clause if semantic search is available
+        if knn_clause:
+            body["knn"] = knn_clause
 
         result = await es.search(index=DOCUMENT_INDEX, body=body)
 
