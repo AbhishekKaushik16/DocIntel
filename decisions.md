@@ -55,3 +55,22 @@ This is a running log of the real calls we made while building DocIntel, focusin
 *   **The alternatives:** A standard synchronous HTTP request that forces the user to wait 10-15 seconds while the agent fetches tools and generates a complete response.
 *   **The reasoning:** We wanted to prioritize a delightful end-to-end user journey. When an LLM executes tools (like querying a database), the latency is massive. By implementing streaming, we provide immediate visual feedback (the tool logs stream in instantly), and the user sees the answer being typed out word-by-word. We even implemented a resilient fallback in the frontend parser to ensure the UI doesn't break if the AI fails to perfectly format its XML response.
 *   **What you deliberately cut:** We chose to use plain React `ReadableStream` logic rather than adopting heavy real-time websocket frameworks like Socket.io or GraphQL subscriptions, minimizing our backend dependency footprint while still delivering a highly interactive experience.
+
+---
+
+## 7. Clarifications & Ambiguities
+
+The problem statement was intentionally open-ended: *"Turn messy documents into structured, queryable data"*. Here are the key ambiguities we identified and the calls we made:
+
+*   **Ambiguity 1: What defines a "messy document" and "structured data"?**
+    *   *Our Call:* We decided against hardcoding a rigid schema for a single document type (like just parsing invoices). Instead, we interpreted "structured data" as a completely dynamic requirement. Our pipeline uses an LLM to dynamically determine the document type and extract an arbitrary, highly-nested JSON schema that fits the specific document, whether it's an invoice, a resume, or a 100-page contract.
+*   **Ambiguity 2: What does "queryable" actually mean?**
+    *   *Our Call:* "Queryable" usually implies basic keyword search (like `LIKE %term%`). We decided that true document intelligence requires multiple axes of querying. We implemented **hybrid semantic search** (via Elasticsearch) for conceptual questions, and paired it with an **agentic tool-use layer** that can execute exact JSONB lookups and mathematical aggregations (e.g., *"What is the average total of all invoices?"*) directly against the structured data in Postgres.
+*   **Ambiguity 3: What happens when the extraction is wrong?**
+    *   *Our Call:* Messy documents lead to messy extractions. Rather than forcing a human to review every single math mistake the LLM makes, we interpreted this as an opportunity for automation. We built a validation layer and an autonomous ReAct Resolver Agent to mathematically prove and fix errors (like a hallucinated tax digit) before it ever hits the database.
+*   **Ambiguity 4: Is a "system" just an API or a full product?**
+    *   *Our Call:* An API is a utility, not a product. We interpreted the prompt as a challenge to build a delightful end-to-end user experience. We built a full Next.js frontend with visual status badges, an Agent Trace Viewer for observability, and real-time SSE streaming for the conversational AI query interface to remove perceived latency.
+*   **Ambiguity 5: Should the system include Multi-Tenant User Authentication?**
+    *   *Our Call:* We deliberately scoped out login screens, JWTs, and multi-tenant data isolation. While building row-level security in Postgres and filtered indices in Elasticsearch is important for production, it is fundamentally a solved engineering problem (mostly boilerplate). Given the 5-day constraint, we chose to optimize for **depth over breadth**. We invested that time into solving the genuinely hard, novel sub-problems (like the autonomous ReAct Resolver Agent and SSE LLM streaming) rather than building a standard login flow that reviewers have seen a thousand times.
+*   **Ambiguity 6: Does "handling the real world" mean scaling to concurrent users?**
+    *   *Our Call:* Yes. A naïve solution processes documents synchronously and falls over if two users upload 100-page PDFs at the same time. We engineered for true concurrency. By decoupling the API from the heavy LLM/OCR processing via **Celery and Redis**, the FastAPI backend instantly absorbs massive load spikes. Our Celery workers process documents in parallel, and because we use `langgraph-checkpoint-postgres`, the state of every single document's pipeline is written transactionally to Postgres, preventing race conditions or memory thrashing under load.

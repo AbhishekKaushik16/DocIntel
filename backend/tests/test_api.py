@@ -66,18 +66,16 @@ async def test_dashboard_stats(client):
 
 @pytest.mark.asyncio
 async def test_query_endpoint(client, monkeypatch):
-    # Mock the run_query_agent to avoid hitting real LLM
-    from app.pipeline.query_agent import QueryResult
+    import json
     
-    async def mock_run_query_agent(question, chat_history=None):
-        return QueryResult(
-            answer=f"Mocked answer for: {question}",
-            sources=[{"document_id": "123", "filename": "mock.pdf", "relevance": 0.99}],
-            agent_reasoning="I used the mock tool.",
-            query_steps=[{"round": 1, "tool": "mock_tool", "input": {}, "output": {}}]
-        )
+    # Mock the stream_query_agent to avoid hitting real LLM
+    async def mock_stream_query_agent(question, chat_history=None):
+        yield f"data: {json.dumps({'type': 'step', 'content': {'round': 1, 'tool': 'mock_tool', 'input': {}, 'output': {}}})}\n\n"
+        yield f"data: {json.dumps({'type': 'token', 'content': 'Mocked answer for: '})}\n\n"
+        yield f"data: {json.dumps({'type': 'token', 'content': question})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'sources': [{'document_id': '123', 'filename': 'mock.pdf', 'relevance': 0.99}], 'reasoning': 'I used the mock tool.', 'steps': [{'round': 1, 'tool': 'mock_tool', 'input': {}, 'output': {}}]})}\n\n"
 
-    monkeypatch.setattr("app.pipeline.query_agent.run_query_agent", mock_run_query_agent)
+    monkeypatch.setattr("app.pipeline.query_agent.stream_query_agent", mock_stream_query_agent)
 
     payload = {
         "question": "What is the total revenue?",
@@ -86,8 +84,9 @@ async def test_query_endpoint(client, monkeypatch):
     response = await client.post("/api/query", json=payload)
     
     assert response.status_code == 200
-    data = response.json()
-    assert data["answer"] == "Mocked answer for: What is the total revenue?"
-    assert len(data["sources"]) == 1
-    assert data["sources"][0]["filename"] == "mock.pdf"
-    assert data["agent_reasoning"] == "I used the mock tool."
+    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+    
+    content = response.content.decode("utf-8")
+    assert "Mocked answer for: What is the total revenue?" in content
+    assert "mock.pdf" in content
+    assert "mock_tool" in content
