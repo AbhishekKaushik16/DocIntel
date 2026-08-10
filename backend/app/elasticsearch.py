@@ -48,7 +48,7 @@ INDEX_SETTINGS = {
             "status": {"type": "keyword"},
             "confidence_score": {"type": "float"},
             "raw_text": {"type": "text", "analyzer": "document_analyzer"},
-            "extracted_data": {"type": "object", "dynamic": True},
+            "extracted_data": {"type": "flattened"},
             "created_at": {"type": "date"},
             "indexed_at": {"type": "date"},
             "document_vector": {
