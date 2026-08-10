@@ -83,7 +83,7 @@ export default function AgentTraceViewer({ reasoning, agentSteps }: AgentTraceVi
           <div className="relative pl-6 space-y-4 before:absolute before:inset-0 before:ml-[1.4rem] before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-indigo-500/20 before:via-indigo-500/10 before:to-transparent">
             {groupedSteps.map((group, idx) => {
               
-              if (group.type === 'single_step' && group.step.role === 'thought') {
+              if (group.type === 'single_step' && group.step && group.step.role === 'thought') {
                 return (
                   <div key={idx} className="relative flex items-start gap-4">
                     <div className="absolute left-[-24px] top-1.5 w-2 h-2 rounded-full bg-indigo-400 ring-4 ring-[#0f1524]"></div>
@@ -95,7 +95,7 @@ export default function AgentTraceViewer({ reasoning, agentSteps }: AgentTraceVi
                 );
               }
 
-              if (group.type === 'tool_interaction' || (group.type === 'single_step' && group.step.role === 'tool_call')) {
+              if (group.type === 'tool_interaction' || (group.type === 'single_step' && group.step && group.step.role === 'tool_call')) {
                 const call = group.type === 'tool_interaction' ? group.call : group.step;
                 const result = group.type === 'tool_interaction' ? group.result : null;
                 const isExpanded = expandedIndices.has(group.originalIndex);
@@ -113,7 +113,7 @@ export default function AgentTraceViewer({ reasoning, agentSteps }: AgentTraceVi
                       >
                         <div className="flex items-center gap-2">
                           <span className="text-emerald-400 font-bold text-xs uppercase tracking-wide">Tool Call</span>
-                          <span className="text-emerald-200 bg-emerald-900/40 px-2 py-0.5 rounded text-xs">{call.tool_name}</span>
+                          <span className="text-emerald-200 bg-emerald-900/40 px-2 py-0.5 rounded text-xs">{call?.tool_name}</span>
                         </div>
                         {isExpanded ? <ChevronDown className="w-4 h-4 text-emerald-500" /> : <ChevronRight className="w-4 h-4 text-emerald-500" />}
                       </button>
@@ -123,7 +123,7 @@ export default function AgentTraceViewer({ reasoning, agentSteps }: AgentTraceVi
                           <div>
                             <span className="text-[10px] text-emerald-500 uppercase font-bold tracking-wider mb-1 block">Arguments</span>
                             <pre className="text-xs text-gray-300 bg-black/40 p-2 rounded overflow-x-auto">
-                              {JSON.stringify(call.tool_args, null, 2)}
+                              {JSON.stringify(call?.tool_args, null, 2)}
                             </pre>
                           </div>
                           
