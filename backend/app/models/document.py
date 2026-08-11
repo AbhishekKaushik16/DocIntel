@@ -175,7 +175,6 @@ class ExtractedField(Base):
 
     __table_args__ = (
         Index("idx_extracted_fields_field_name", "field_name"),
-        Index("idx_extracted_fields_field_name_value", "field_name", "field_value"),
     )
 
 
