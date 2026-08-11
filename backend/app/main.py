@@ -12,7 +12,14 @@ from app.database import init_db
 from app.api.documents import router as documents_router
 from app.api.search import router as search_router
 from app.api.query import router as query_router
+import logging
 
+# Configure root logger with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
